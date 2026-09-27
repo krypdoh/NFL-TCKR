@@ -6,7 +6,7 @@ Displays a scrolling top-of-screen bar with team logos, colored names, scores,
 down & distance, last play, QB stats, ball-on field position, and a possession
 football icon.
 
-**Version:** 0.1.23  
+**Version:** 0.1.24  
 **Data:** ESPN public site API ([Public-ESPN-API](https://github.com/pseudo-r/Public-ESPN-API))
 
 ---

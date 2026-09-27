@@ -11,7 +11,7 @@ stats, ball-on, and possession. Data via ESPN public site API. Integrates with
 Windows AppBar for docked desktop reservation (same model as MLB-TCKR).
 """
 
-VERSION = "0.1.23"
+VERSION = "0.1.24"
 
 import ctypes
 from ctypes import wintypes

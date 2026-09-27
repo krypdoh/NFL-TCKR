@@ -1,6 +1,25 @@
 NFL-TCKR CHANGELOG
 ==================
 
+0.1.24 — 2026-09-27
+-------------------
+- Live center: fixed 4-row slots so clock Y stays put with or without last play;
+  more gap clock→down, play a tad lower, clock face +1px
+- Clock > 2:00: time + down in bright blue, dash white; down line & and @ always white
+- Logo / name / score gaps use visible ink (not canvas pad) and a shared 10px spacing
+- Inter-game gap 40% tighter (~1.8× bar height instead of 3×)
+- Timeout dashes use the team-name color; row sits 1px lower
+- Last play: Gotham Medium then smaller, now fonts/zed-sans-regular.ttf
+- Fonts: installed family first, then fonts/, then default; --debug logs every role
+- Scroll: ESPN fetch on _SlateThread, cards on _CardBuildThread (QImage); idle
+  scoreboard poll 60s when no live / kickoff-soon games
+- Intro: yellow "NFL-TCKR" centered 3s, then scroll in from the right; --faststart skips
+- Loop marker: logos/nfl-com-logo.png at the start of each pass
+- Right-click + tray: About… (author, 2026 copyright, github.com/krypdoh/NFL-TCKR)
+- build-nfltckr.ps1: onefile PyInstaller (console + noconsole) and Authenticode sign
+- Frozen APP_DIR uses sys._MEIPASS so bundled fonts/logos/images resolve in the exe
+- .gitignore: build/, dist/, logs, pycache, exes, signing certs
+
 0.1.23 — 2026-09-27
 -------------------
 - Logo / possession-icon white glow much more subtle: lower opacity (~half),
