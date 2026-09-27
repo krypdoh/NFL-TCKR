@@ -123,7 +123,10 @@ class _VBlankDriver(QtCore.QThread):
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    APP_DIR = sys._MEIPASS
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(APP_DIR)
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NFL-TCKR")
 SETTINGS_FILE = os.path.join(APPDATA_DIR, "NFL-TCKR.Settings.json")
