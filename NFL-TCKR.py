@@ -130,12 +130,14 @@ SETTINGS_FILE = os.path.join(APPDATA_DIR, "NFL-TCKR.Settings.json")
 LOGO_DIR = os.path.join(APP_DIR, "logos")
 IMAGES_DIR = os.path.join(APP_DIR, "images")
 FOOTBALL_ICON_PATH = os.path.join(IMAGES_DIR, "football-icon.jpg")
+NFL_COM_LOGO_PATH = os.path.join(LOGO_DIR, "nfl-com-logo.png")
 
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
 
 QB_ROTATE_MS = 5000
 QB_MIN_ATTEMPTS = 4  # proxy for "snaps" — ESPN boxscore has no snap count here
+INTRO_HOLD_MS = 3000  # centered yellow title before the first scroll
 SCORE_ALERT_HOLD_MS = 6000  # hold phase duration for scoring flash
 SCORE_ALERT_IN_MS = 600
 SCORE_ALERT_OUT_MS = 400
@@ -152,8 +154,8 @@ _NFL_DEBUG = os.environ.get("NFL_TCKR_DEBUG", "1").strip().lower() not in (
 # Or NFL_TCKR_SCROLL_DEBUG=1. NFL_TCKR_SCROLL_DEBUG=0 forces off.
 SCROLL_DEBUG = False
 _cli_debug = "--debug" in sys.argv
-if _cli_debug:
-    sys.argv = [a for a in sys.argv if a != "--debug"]
+_cli_faststart = "--faststart" in sys.argv
+sys.argv = [a for a in sys.argv if a not in ("--debug", "--faststart")]
 _env_scroll = os.environ.get("NFL_TCKR_SCROLL_DEBUG", "").strip().lower()
 if _env_scroll in ("0", "false", "no", "off"):
     _NFL_SCROLL_DEBUG = False
@@ -286,7 +288,14 @@ NFL_CITY_ABBR = {
 }
 
 _LOGO_CACHE = {}
+_LOGO_INK_CACHE = {}
 _FOOTBALL_CACHE = {}
+_IMAGE_CACHE_LOCK = threading.Lock()
+_FINAL_SUMMARY_CACHE = {}
+_FINAL_SUMMARY_LOCK = threading.Lock()
+# No live games: poll the scoreboard slowly. Near kickoff, keep the normal interval.
+_IDLE_POLL_SECONDS = 60
+_KICKOFF_SOON_SECONDS = 10 * 60
 _SETTINGS_CACHE = None
 _SETTINGS_LOCK = threading.Lock()
 
@@ -305,7 +314,7 @@ def get_settings():
         "speed": 5,
         "update_interval": 15,
         "ticker_height": 72,
-        "game_spacing_percent": 100,  # 100% ≈ 3× ticker height between cards (MLB-TCKR feel)
+        "game_spacing_percent": 100,  # 100% ≈ 1.8× ticker height between cards
         "font": "Ozone",
         "font_scale_percent": 160,
         "player_info_font": "Gotham Black",  # Match MLB-TCKR player/stat text
@@ -415,81 +424,493 @@ def display_team_name(full_name, settings):
     return nick
 
 
+def _blank_image(w, h):
+    img = QtGui.QImage(
+        max(1, int(w)), max(1, int(h)), QtGui.QImage.Format_ARGB32_Premultiplied,
+    )
+    img.fill(0)
+    return img
+
+
 def get_team_logo(full_name, size=40):
     key = (full_name, size)
-    if key in _LOGO_CACHE:
-        return _LOGO_CACHE[key]
-    nick = get_team_nickname(full_name)
-    fname = NFL_LOGO_FILES.get(nick)
-    path = os.path.join(LOGO_DIR, fname) if fname else None
-    pix = QtGui.QPixmap()
-    if path and os.path.isfile(path):
-        pix = QtGui.QPixmap(path)
-        if not pix.isNull():
-            pix = pix.scaled(size, size, QtCore.Qt.KeepAspectRatio,
-                             QtCore.Qt.SmoothTransformation)
-    if pix.isNull():
-        pix = QtGui.QPixmap(size, size)
-        pix.fill(QtCore.Qt.transparent)
-        p = QtGui.QPainter(pix)
-        color = QtGui.QColor(get_team_color(full_name))
-        p.fillRect(0, 0, size, size, color)
-        p.setPen(QtGui.QColor("#FFFFFF"))
-        p.drawText(pix.rect(), QtCore.Qt.AlignCenter, (nick or "?")[:3].upper())
-        p.end()
-    _LOGO_CACHE[key] = pix
-    return pix
+    with _IMAGE_CACHE_LOCK:
+        cached = _LOGO_CACHE.get(key)
+        if cached is not None:
+            return cached
+        nick = get_team_nickname(full_name)
+        fname = NFL_LOGO_FILES.get(nick)
+        path = os.path.join(LOGO_DIR, fname) if fname else None
+        img = QtGui.QImage()
+        if path and os.path.isfile(path):
+            img = QtGui.QImage(path)
+            if not img.isNull():
+                img = img.scaled(size, size, QtCore.Qt.KeepAspectRatio,
+                                 QtCore.Qt.SmoothTransformation)
+        if img.isNull():
+            img = _blank_image(size, size)
+            p = QtGui.QPainter(img)
+            color = QtGui.QColor(get_team_color(full_name))
+            p.fillRect(0, 0, size, size, color)
+            p.setPen(QtGui.QColor("#FFFFFF"))
+            p.drawText(img.rect(), QtCore.Qt.AlignCenter, (nick or "?")[:3].upper())
+            p.end()
+        _LOGO_CACHE[key] = img
+        _LOGO_INK_CACHE[key] = _opaque_bounds(img)
+        return img
+
+
+def _opaque_bounds(img, alpha_min=24):
+    """Inclusive pixel box of visible ink. Full image if nothing is opaque."""
+    if img is None or img.isNull():
+        return 0, 0, 0, 0
+    w, h = img.width(), img.height()
+    min_x, min_y = w, h
+    max_x, max_y = -1, -1
+    for y in range(h):
+        for x in range(w):
+            if img.pixelColor(x, y).alpha() >= alpha_min:
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
+    if max_x < 0:
+        return 0, 0, max(0, w - 1), max(0, h - 1)
+    return min_x, min_y, max_x, max_y
+
+
+def _logo_visual(img, cache_key=None):
+    """left pad, right pad, top pad, bottom pad, ink width, ink height."""
+    w = max(1, img.width()) if img is not None and not img.isNull() else 1
+    hgt = max(1, img.height()) if img is not None and not img.isNull() else 1
+    box = None
+    if cache_key is not None:
+        with _IMAGE_CACHE_LOCK:
+            box = _LOGO_INK_CACHE.get(cache_key)
+    if box is None:
+        box = _opaque_bounds(img)
+        if cache_key is not None:
+            with _IMAGE_CACHE_LOCK:
+                _LOGO_INK_CACHE[cache_key] = box
+    left, top, right, bottom = box
+    return (
+        left,
+        w - 1 - right,
+        top,
+        hgt - 1 - bottom,
+        max(1, right - left + 1),
+        max(1, bottom - top + 1),
+    )
+
+
+def _text_right_slack(fm, text, advance):
+    """Empty px between the last glyph and the advance width."""
+    br = fm.tightBoundingRect(text or "0")
+    used = max(0, br.x() + br.width())
+    return max(0, int(advance) - used)
+
+
+def _text_left_slack(fm, text):
+    """Empty px before the first glyph."""
+    return max(0, fm.tightBoundingRect(text or "0").x())
+
+
+def get_nfl_com_logo(height):
+    """NFL shield from logos/nfl-com-logo.png, scaled to the ticker height."""
+    key = ("nfl-com", int(height))
+    with _IMAGE_CACHE_LOCK:
+        cached = _LOGO_CACHE.get(key)
+        if cached is not None:
+            return cached
+        img = QtGui.QImage()
+        if os.path.isfile(NFL_COM_LOGO_PATH):
+            img = QtGui.QImage(NFL_COM_LOGO_PATH)
+            if not img.isNull():
+                img = img.scaled(
+                    int(height), int(height),
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation,
+                )
+        if img.isNull():
+            img = _blank_image(height, height)
+            p = QtGui.QPainter(img)
+            p.setPen(QtGui.QColor("#FFFFFF"))
+            p.drawText(img.rect(), QtCore.Qt.AlignCenter, "NFL")
+            p.end()
+        _LOGO_CACHE[key] = img
+        return img
+
+
+def build_loop_marker_card(host):
+    """Card at the start of each scroll loop: the NFL.com shield."""
+    h = int(host.ticker_height)
+    dpr = float(host.dpr)
+    logo = get_nfl_com_logo(max(24, int(h * 0.88)))
+    pad_x = max(12, int(h * 0.28))
+    logo_w = logo.width()
+    logo_h = logo.height()
+    total_w = pad_x * 2 + logo_w
+    image = QtGui.QImage(
+        max(1, int(total_w * dpr)),
+        max(1, int(h * dpr)),
+        QtGui.QImage.Format_ARGB32_Premultiplied,
+    )
+    image.setDevicePixelRatio(dpr)
+    image.fill(0)
+    painter = QtGui.QPainter(image)
+    painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+    painter.drawImage(pad_x, (h - logo_h) // 2, logo)
+    painter.end()
+    return image
 
 
 def get_football_icon(size=14):
     key = size
-    if key in _FOOTBALL_CACHE:
-        return _FOOTBALL_CACHE[key]
-    path = FOOTBALL_ICON_PATH
-    if not os.path.isfile(path):
-        alt = os.path.join(LOGO_DIR, "football-icon.jpg")
-        path = alt if os.path.isfile(alt) else path
-    pix = QtGui.QPixmap()
-    if os.path.isfile(path):
-        pix = QtGui.QPixmap(path)
-        if not pix.isNull():
-            pix = pix.scaled(size, size, QtCore.Qt.KeepAspectRatio,
-                             QtCore.Qt.SmoothTransformation)
-    if pix.isNull():
-        pix = QtGui.QPixmap(size, size)
-        pix.fill(QtCore.Qt.transparent)
-        p = QtGui.QPainter(pix)
-        p.setRenderHint(QtGui.QPainter.Antialiasing)
-        p.setBrush(QtGui.QColor("#8B4513"))
-        p.setPen(QtGui.QColor("#D2B48C"))
-        p.drawEllipse(1, 1, size - 2, size - 2)
-        p.end()
-    _FOOTBALL_CACHE[key] = pix
-    return pix
+    with _IMAGE_CACHE_LOCK:
+        cached = _FOOTBALL_CACHE.get(key)
+        if cached is not None:
+            return cached
+        path = FOOTBALL_ICON_PATH
+        if not os.path.isfile(path):
+            alt = os.path.join(LOGO_DIR, "football-icon.jpg")
+            path = alt if os.path.isfile(alt) else path
+        img = QtGui.QImage()
+        if os.path.isfile(path):
+            img = QtGui.QImage(path)
+            if not img.isNull():
+                img = img.scaled(size, size, QtCore.Qt.KeepAspectRatio,
+                                 QtCore.Qt.SmoothTransformation)
+        if img.isNull():
+            img = _blank_image(size, size)
+            p = QtGui.QPainter(img)
+            p.setRenderHint(QtGui.QPainter.Antialiasing)
+            p.setBrush(QtGui.QColor("#8B4513"))
+            p.setPen(QtGui.QColor("#D2B48C"))
+            p.drawEllipse(1, 1, size - 2, size - 2)
+            p.end()
+        _FOOTBALL_CACHE[key] = img
+        return img
+
+
+_RESOLVED_FONTS = {}
+_SYSTEM_FONT_FAMILIES = None
+
+
+def _bundled_file_hint(requested):
+    """Filename in fonts/ whose stem matches requested, if any."""
+    best = None
+    best_score = 0
+    for path in _bundled_font_files():
+        stem = os.path.splitext(os.path.basename(path))[0].replace("-", " ").replace("_", " ")
+        score = _font_name_score(requested, stem)
+        if score > best_score:
+            best_score = score
+            best = os.path.basename(path)
+            if score == 2:
+                break
+    return best
+
+
+def _bundled_font_files():
+    """ttf/otf files shipped in the project fonts folder."""
+    seen = set()
+    folders = (
+        os.path.join(APP_DIR, "fonts"),
+        os.path.join(REPO_ROOT, "fonts"),
+        os.path.join(REPO_ROOT, "docs"),
+    )
+    for folder in folders:
+        if not os.path.isdir(folder):
+            continue
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith((".ttf", ".otf", ".ttc")):
+                continue
+            path = os.path.join(folder, name)
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen or not os.path.isfile(path):
+                continue
+            seen.add(key)
+            yield path
+
+
+def _font_name_score(requested, family):
+    """2 = exact family, 1 = same face with a weight suffix, 0 = no match."""
+    req = " ".join((requested or "").split()).lower()
+    fam = " ".join((family or "").split()).lower()
+    if not req or not fam:
+        return 0
+    if fam == req:
+        return 2
+    if req.startswith(fam + " ") or fam.startswith(req + " "):
+        return 1
+    return 0
+
+
+def _load_bundled_family(requested):
+    """Register a fonts-folder file whose family matches requested. None if none."""
+    best_fid = -1
+    best_family = None
+    best_score = (0, 0)
+    req_tokens = (requested or "").lower().split()
+    db = QtGui.QFontDatabase
+    for path in _bundled_font_files():
+        fid = db.addApplicationFont(path)
+        if fid < 0:
+            continue
+        score = (0, 0)
+        family = None
+        stem = os.path.splitext(os.path.basename(path))[0].lower().replace("-", " ").replace("_", " ")
+        for fam in db.applicationFontFamilies(fid) or []:
+            name_score = _font_name_score(requested, fam)
+            if name_score <= 0:
+                continue
+            extra = [t for t in req_tokens if t not in fam.lower().split()]
+            bonus = sum(1 for t in extra if t in stem)
+            cand = (name_score, bonus)
+            if cand > score:
+                score = cand
+                family = fam
+        if family and score > best_score:
+            if best_fid >= 0:
+                db.removeApplicationFont(best_fid)
+            best_fid = fid
+            best_family = family
+            best_score = score
+            if score[0] == 2:
+                break
+        else:
+            db.removeApplicationFont(fid)
+    return best_family
+
+
+def _load_bundled_font_file(filename):
+    """Register one fonts-folder file by basename. Returns (family, source)."""
+    want = os.path.basename(filename or "").lower()
+    if not want:
+        return None, None
+    db = QtGui.QFontDatabase
+    for path in _bundled_font_files():
+        if os.path.basename(path).lower() != want:
+            continue
+        fid = db.addApplicationFont(path)
+        if fid < 0:
+            return None, None
+        families = db.applicationFontFamilies(fid) or []
+        if not families:
+            return None, None
+        return families[0], f"fonts/{os.path.basename(path)}"
+    return None, None
+
+
+def resolve_font_family(requested, default="Arial Black"):
+    """Installed family, then a match in fonts/, then default.
+
+    default is used as-is when it is already available, otherwise it is
+    resolved the same way (installed, then fonts/).
+    """
+    requested = " ".join(str(requested or "").split())
+    default = " ".join(str(default or "Arial Black").split()) or "Arial Black"
+    key = (requested.lower(), default.lower())
+    cached = _RESOLVED_FONTS.get(key)
+    if cached:
+        return cached[0]
+
+    global _SYSTEM_FONT_FAMILIES
+    if _SYSTEM_FONT_FAMILIES is None:
+        # Captured once, before any fonts-folder file is registered.
+        _SYSTEM_FONT_FAMILIES = set(QtGui.QFontDatabase().families())
+    families = set(QtGui.QFontDatabase().families())
+
+    def _pick(name, via_default):
+        if not name:
+            return None, None
+        if name in _SYSTEM_FONT_FAMILIES or name in families:
+            # families() also sees faces this process already loaded from fonts/.
+            if name in _SYSTEM_FONT_FAMILIES:
+                source = "default, installed" if via_default else "installed"
+            else:
+                source = "default, fonts folder" if via_default else "fonts folder"
+            hint = _bundled_file_hint(name)
+            if source.endswith("installed") and hint:
+                source = f"{source}; fonts/{hint} also present, not used"
+            return name, source
+        loaded = _load_bundled_family(name)
+        if loaded:
+            families.add(loaded)
+            source = "default, fonts folder" if via_default else "fonts folder"
+            return loaded, source
+        return None, None
+
+    family, source = _pick(requested, False)
+    if not family:
+        family, source = _pick(default, True)
+    if not family:
+        family, source = "Arial", "fallback"
+    _RESOLVED_FONTS[key] = (family, source)
+    return family
+
+
+def font_resolve_source(requested, default="Arial Black"):
+    """How resolve_font_family found the face: installed, fonts folder, or default."""
+    resolve_font_family(requested, default)
+    requested = " ".join(str(requested or "").split())
+    default = " ".join(str(default or "Arial Black").split()) or "Arial Black"
+    return _RESOLVED_FONTS[(requested.lower(), default.lower())][1]
+
+
+def _font_debug_desc(font):
+    info = QtGui.QFontInfo(font)
+    style = (info.styleName() or "").strip()
+    face = info.family()
+    if style and style.lower() not in face.lower():
+        face = f"{face} {style}"
+    weight = "bold" if font.bold() else "regular"
+    return f"{face} {font.pixelSize()}px {weight} (draws {info.family()})"
 
 
 def load_ticker_font():
-    candidates = [
-        os.path.join(REPO_ROOT, "fonts", "Ozone-xRRO.ttf"),
-        os.path.join(REPO_ROOT, "docs", "Ozone-xRRO.ttf"),
-        os.path.join(APP_DIR, "fonts", "Ozone-xRRO.ttf"),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            fid = QtGui.QFontDatabase.addApplicationFont(path)
-            if fid >= 0:
-                families = QtGui.QFontDatabase.applicationFontFamilies(fid)
-                if families:
-                    return families[0]
-    return "Arial Black"
+    return resolve_font_family("Ozone", "Arial Black")
 
 
 def load_player_font_family(fallback):
-    """Same player-stats face as MLB-TCKR: Gotham Black when installed."""
-    target = "Gotham Black"
-    if target in QtGui.QFontDatabase().families():
-        return target
+    """Player-stats face: installed Gotham Black, then fonts/, then fallback."""
+    return resolve_font_family("Gotham Black", fallback)
+
+
+def load_center_sans_family(player_family, ticker_family):
+    """Heavy sans for the live down and play lines.
+
+    Gotham Black when that family is installed (same resolve as the QB line).
+    Otherwise the bundled Roboto Black face — the LED ticker font is not a
+    stand-in for this block.
+    """
+    families = set(QtGui.QFontDatabase().families())
+    gotham_ready = (
+        "Gotham" in families
+        or "Gotham Black" in families
+        or (player_family and "Gotham" in player_family and player_family in families)
+    )
+    if gotham_ready:
+        return _player_mixed_weight_family(player_family, ticker_family)
+    for path in (
+        os.path.join(REPO_ROOT, "fonts", "Roboto-Black.ttf"),
+        os.path.join(APP_DIR, "fonts", "Roboto-Black.ttf"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        fid = QtGui.QFontDatabase.addApplicationFont(path)
+        if fid < 0:
+            continue
+        fams = QtGui.QFontDatabase.applicationFontFamilies(fid)
+        if fams:
+            return fams[0]
+    return ticker_family
+
+
+def _player_mixed_weight_family(player_family, fallback):
+    """Base typeface for QB player-stats text (resolves to Gotham Black via heavy).
+
+    Display-only families like 'Gotham Black' have no in-family style variants;
+    map those to the base family so _qfont_weight_variant(..., 'heavy') can pick
+    the Black sibling display face for both full-size and label-size fonts.
+    """
+    families = set(QtGui.QFontDatabase().families())
+    # Separate ultra-weight faces → parent family with real Bold/Book styles
+    base_map = {
+        "Gotham Black": "Gotham",
+        "Gotham Ultra": "Gotham",
+        "Gotham Thin": "Gotham",
+        "Gotham XLight": "Gotham",
+    }
+    mapped = base_map.get(player_family or "")
+    if mapped and mapped in families:
+        return mapped
+    if player_family and player_family in families:
+        return player_family
     return fallback
+
+
+def _qfont_weight_variant(family, pixel_size, weight="regular"):
+    """QFont at pixel_size: heavy / bold / regular faces.
+
+    weight:
+      - 'heavy' — Black/ExtraBold/Heavy (QB line: both full-size and labels);
+        may use sibling display families like 'Gotham Black'
+      - 'bold'  — SemiBold / Medium (legacy / non-QB); Bold only as fallback
+      - 'regular' — Book/Regular (non-QB small text)
+
+    Prefer QFontDatabase.font(family, style) — on Windows, QFont.setStyleName()
+    often reports the style name but still renders the Book face. When a heavier
+    face is missing, return the best available; callers may faux-bold via 1px
+    double-draw if needed (QB line currently uses size, not weight, contrast).
+    """
+    db = QtGui.QFontDatabase()
+    families = set(db.families())
+
+    def _from_styles(fam, style_names):
+        fam_styles = set(db.styles(fam) or [])
+        for style in style_names:
+            if style in fam_styles:
+                font = db.font(fam, style, -1)
+                font.setPixelSize(pixel_size)
+                return font
+        return None
+
+    if weight == "heavy":
+        # In-family heavy styles only — do not fall through to Bold here, or we
+        # skip sibling display families like 'Gotham Black'.
+        font = _from_styles(family, ("Black", "ExtraBold", "Heavy", "Ultra"))
+        if font is not None:
+            return font
+        for suffix in (" Black", " ExtraBold", " Heavy", " Ultra"):
+            cand = family + suffix
+            if cand in families:
+                font = _from_styles(cand, ("Regular", "Black", "Normal", "Book", "Bold"))
+                if font is not None:
+                    return font
+        # No true heavy face — Bold then lighter; caller may faux-bold
+        font = _from_styles(family, ("Bold", "Medium", "Book", "Regular", "Normal"))
+        if font is not None:
+            return font
+    elif weight == "bold":
+        # Labels: prefer SemiBold / Medium over full Bold when available
+        font = _from_styles(
+            family,
+            ("SemiBold", "Semi Bold", "Medium", "Bold", "Book", "Regular", "Normal"),
+        )
+        if font is not None:
+            return font
+    else:
+        font = _from_styles(family, ("Book", "Regular", "Normal", "Medium"))
+        if font is not None:
+            return font
+
+    font = QtGui.QFont(family)
+    font.setPixelSize(pixel_size)
+    font.setBold(False)
+    font.setWeight(QtGui.QFont.Normal)
+    return font
+
+
+def _needs_faux_bold(bold_font, regular_font):
+    """True when bold_font is not actually heavier (single-weight / failed resolve).
+
+    Sibling display families (e.g. Gotham Black vs Gotham Bold) often report
+    misleading OS weight numbers; a different family name means a real heavy face.
+    """
+    bi = QtGui.QFontInfo(bold_font)
+    ri = QtGui.QFontInfo(regular_font)
+    if bi.family() != ri.family():
+        return False
+    return bi.weight() <= ri.weight()
 
 
 # ---------------------------------------------------------------------------
@@ -620,11 +1041,293 @@ def _http_get(url, params=None):
 
 
 def _ordinal_down(down):
+    """1st–4th only. ESPN sends down=-1 when no down is active (timeout, kickoff)."""
     try:
         d = int(down)
     except (TypeError, ValueError):
         return ""
-    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(d, f"{d}th")
+    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(d, "")
+
+
+def _competitor_lines(competitor):
+    """Points by period from ESPN linescores, in order (Q1, Q2, …)."""
+    vals = []
+    for row in (competitor or {}).get("linescores") or []:
+        if isinstance(row, dict):
+            val = row.get("displayValue")
+            if val is None or val == "":
+                val = row.get("value")
+        else:
+            val = row
+        vals.append("" if val is None else str(val))
+    return vals
+
+
+def _period_header(index):
+    if index < 4:
+        return str(index + 1)
+    if index == 4:
+        return "OT"
+    return f"{index - 3}OT"
+
+
+def _break_heading(game):
+    """Center heading when the period is over. Empty during live play.
+
+    End of 1st / halftime / end of 3rd / final → END 1ST, HALFTIME, END 3RD, FINAL.
+    """
+    state = (game.get("state") or "").strip().lower()
+    blob = " ".join([
+        str(game.get("status_detail") or ""),
+        str(game.get("status") or ""),
+    ]).lower().replace(".", " ")
+    blob = re.sub(r"\s+", " ", blob).strip()
+    if state == "post" or re.search(r"\bfinal\b", blob):
+        return "FINAL"
+    if "halftime" in blob or "half time" in blob:
+        return "HALFTIME"
+    match = re.search(r"end(?:\s+of)?(?:\s+the)?\s+(1st|2nd|3rd|4th)", blob)
+    if not match:
+        return ""
+    quarter = match.group(1).upper()
+    if quarter == "2ND":
+        return "HALFTIME"
+    if quarter == "4TH":
+        return "FINAL"
+    return f"END {quarter}"
+
+
+def _clock_seconds(status_detail):
+    """Remaining seconds from a clock like '5:46 - 2nd', or None."""
+    text = (status_detail or "").strip()
+    match = re.search(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _clock_under_two_minutes(status_detail):
+    """True when the shown clock is 2:00 or less in the 2nd, 4th, or OT."""
+    text = (status_detail or "").strip()
+    match = re.search(
+        r"(?:(1st|2nd|3rd|4th|ot)\s+)?"
+        r"(\d{1,2}):(\d{2})"
+        r"(?:\s*-\s*(1st|2nd|3rd|4th|ot))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    quarter = (match.group(1) or match.group(4) or "").lower()
+    if quarter not in ("2nd", "4th", "ot"):
+        return False
+    seconds = int(match.group(2)) * 60 + int(match.group(3))
+    return seconds <= 2 * 60
+
+
+def _clock_over_two_minutes(status_detail):
+    """True when a parseable game clock is strictly over 2:00."""
+    seconds = _clock_seconds(status_detail)
+    return seconds is not None and seconds > 2 * 60
+
+
+def _split_clock_line(text):
+    """Split '5:46 - 2ND' into (time, dash, quarter). Missing parts are ''."""
+    match = re.match(
+        r"^(\d{1,2}:\d{2})(\s*-\s*)(.*)$",
+        (text or "").strip(),
+    )
+    if not match:
+        return (text or "", "", "")
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _sit_color_segments(text):
+    """Split a down line so '&' and '@' can be drawn white."""
+    parts = []
+    buf = []
+    for ch in text or "":
+        if ch in "&@":
+            if buf:
+                parts.append(("".join(buf), False))
+                buf = []
+            parts.append((ch, True))
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append(("".join(buf), False))
+    return parts
+
+
+def _glyph_line(fm, text, fallback="A"):
+    """Visual line height and baseline offset from the top of the glyphs."""
+    sample = text or fallback
+    br = fm.tightBoundingRect(sample)
+    if br.width() <= 0 or br.height() <= 0:
+        br = fm.boundingRect(sample)
+    if br.height() <= 0:
+        return fm.ascent() + fm.descent(), fm.ascent()
+    ascent = -br.top() if br.top() < 0 else br.height()
+    return br.height(), ascent
+
+
+def _live_center_rows(height, time_m, sit_m, play_m, clock_text, situation_line,
+                      play_lines, gap=1):
+    """Fixed vertical slots for live clock / down / two play lines.
+
+    The clock row is always the same, even when down or last play is empty.
+    The four slots are centered in the bar as a group so the time sits in
+    the upper half (above the score midline) without hugging the top edge.
+    """
+    clock_h, clock_a = _glyph_line(time_m, clock_text or "0:00 - 2ND")
+    sit_h, sit_a = _glyph_line(sit_m, situation_line or "1st & 10 @ AAA 00")
+    play_sample = (play_lines[0] if play_lines else "LAST PLAY")
+    play_h, play_a = _glyph_line(play_m, play_sample)
+    clock_to_sit = max(4, gap + 3)
+    sit_to_play = max(3, gap + 2)
+    play_to_play = gap
+    reserved = (
+        clock_h + sit_h + 2 * play_h
+        + clock_to_sit + sit_to_play + play_to_play
+    )
+    y0 = max(2, (int(height) - reserved) // 2)
+    sit_y = y0 + clock_h + clock_to_sit
+    play_y = sit_y + sit_h + sit_to_play
+    play2_y = play_y + play_h + play_to_play
+    return {
+        "time": (y0, clock_a),
+        "sit": (sit_y, sit_a),
+        "play": (play_y, play_a),
+        "play2": (play2_y, play_a),
+        "reserved": reserved,
+    }
+
+
+def _prepare_linescore(font, game, height, heading="", heading_font=None):
+    """Quarter table for a final: header, away, home. None if ESPN sent no lines."""
+    away_q = list(game.get("away_lines") or [])
+    home_q = list(game.get("home_lines") or [])
+    if not away_q and not home_q:
+        return None
+    n = max(len(away_q), len(home_q), 4)
+
+    def _pad(vals):
+        vals = list(vals) + [""] * (n - len(vals))
+        return [str(v) for v in vals[:n]]
+
+    rows = [
+        [""] + [_period_header(i) for i in range(n)] + ["T"],
+        [str(game.get("away_abbr") or "").upper()] + _pad(away_q) + [str(game.get("away_score") or "0")],
+        [str(game.get("home_abbr") or "").upper()] + _pad(home_q) + [str(game.get("home_score") or "0")],
+    ]
+    face = QtGui.QFont(font)
+    # Smaller than the down/play faces; the heading stays the larger line.
+    px = max(8, int(height * 0.125))
+    head_h = 0
+    head_w = 0
+    if heading and heading_font is not None:
+        head_fm = QtGui.QFontMetrics(heading_font)
+        head_h = head_fm.ascent() + head_fm.descent() + 2
+        head_w = head_fm.horizontalAdvance(heading)
+    while px > 7:
+        face.setPixelSize(px)
+        fm = QtGui.QFontMetrics(face)
+        if head_h + 3 * (fm.ascent() + fm.descent()) + 2 <= height:
+            break
+        px -= 1
+    fm = QtGui.QFontMetrics(face)
+    gap = max(5, px // 2 + 1)
+    cols = len(rows[0])
+    col_w = []
+    for c in range(cols):
+        w = max(fm.horizontalAdvance(row[c]) for row in rows)
+        if c > 0:
+            w = max(w, fm.horizontalAdvance("00"))
+        col_w.append(int(w))
+    table_w = int(sum(col_w) + gap * (cols - 1))
+    return {
+        "font": face,
+        "fm": fm,
+        "rows": rows,
+        "col_w": col_w,
+        "gap": gap,
+        "width": max(table_w, int(head_w)),
+        "heading": heading,
+        "heading_font": heading_font,
+        "head_h": head_h,
+    }
+
+
+def _draw_linescore(painter, left, width, height, table, away_color, home_color):
+    """Draw the break heading, then the quarter table underneath it."""
+    fm = table["fm"]
+    rows = table["rows"]
+    col_w = table["col_w"]
+    gap = table["gap"]
+    line_h = fm.ascent() + fm.descent()
+    table_h = 3 * line_h
+    head_h = int(table.get("head_h") or 0)
+    stack_h = head_h + table_h
+    y0 = (height - stack_h) // 2
+    heading = table.get("heading") or ""
+    heading_font = table.get("heading_font")
+    if heading and heading_font is not None and head_h:
+        head_fm = QtGui.QFontMetrics(heading_font)
+        painter.setFont(heading_font)
+        tw = head_fm.horizontalAdvance(heading)
+        painter.setPen(QtGui.QColor("#FFFFFF"))
+        painter.drawText(
+            int(left + (width - tw) // 2),
+            int(y0 + head_fm.ascent()),
+            heading,
+        )
+        y0 += head_h
+    x0 = left + max(0, (width - (sum(col_w) + gap * (len(col_w) - 1))) // 2)
+    painter.setFont(table["font"])
+    colors = ("#9A9A9A", away_color, home_color)
+    for r, row in enumerate(rows):
+        baseline = y0 + r * line_h + fm.ascent()
+        x = x0
+        for c, text in enumerate(row):
+            if not text:
+                x += col_w[c] + gap
+                continue
+            if r == 0:
+                fill = "#9A9A9A"
+            elif c == 0:
+                fill = colors[r]
+            else:
+                fill = "#FFFFFF"
+            tw = fm.horizontalAdvance(text)
+            tx = x if c == 0 else x + (col_w[c] - tw) // 2
+            painter.setPen(QtGui.QColor(fill))
+            painter.drawText(int(tx), int(baseline), text)
+            x += col_w[c] + gap
+
+
+def _timeout_remaining(value):
+    """Timeouts left this half, clamped to 0–3. None when ESPN omits the field."""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(3, n))
+
+
+def _clean_down_distance(text):
+    """Drop placeholder down text such as '-1th & 0'."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("-"):
+        return ""
+    if re.match(r"^-?\d+th\b", text, flags=re.IGNORECASE):
+        return ""
+    if re.search(r"&\s*0\s*$", text) and "goal" not in text.lower():
+        return ""
+    return text
 
 
 # Generational / suffix tokens kept with the surname (Beckham Jr., Cook III, …)
@@ -689,9 +1392,92 @@ def _qb_last_name(athlete):
     return format_player_lastname(athlete if isinstance(athlete, dict) else {"displayName": athlete})
 
 
-def _format_qb_line(name, completes, yds, td, inter):
+def _athlete_jersey(athlete):
+    """Jersey number string from ESPN athlete dict, or ''."""
+    if not isinstance(athlete, dict):
+        return ""
+    j = athlete.get("jersey") or athlete.get("jerseyNumber") or ""
+    j = str(j).strip()
+    return j
+
+
+def _qb_line_segments(name, yds, td, inter, jersey=""):
+    """Mixed-size parts for under-name QB stats (same face; labels 1px smaller).
+
+    Format: #1 Ward 323 YDS, 1 TD, 0 INT
+    Full size (True): #jersey, last name, yards, TD count, INT count.
+    Label size (False): spaces and YDS/TD/INT labels (+ punctuation). No 'QB'.
+    """
     yds = str(yds).replace(",", "")
-    return f"QB: {name} {completes} {yds}yd {td} TD {inter} Int"
+    segs = []
+    if jersey:
+        segs.append((f"#{jersey}", True))
+        segs.append((" ", False))
+    segs.extend([
+        (str(name), True),
+        (" ", False),
+        (str(yds), True),
+        (" YDS, ", False),
+        (str(td), True),
+        (" TD, ", False),
+        (str(inter), True),
+        (" INT", False),
+    ])
+    return segs
+
+
+def _format_qb_line(name, yds, td, inter, jersey=""):
+    """Plain-text QB stats line (debug / visual-key); see _qb_line_segments for size."""
+    return "".join(t for t, _ in _qb_line_segments(name, yds, td, inter, jersey))
+
+
+def _qb_segments_width(segments, full_font, label_font, faux_bold=False):
+    """Width of QB segments using full-size vs label (size-1) fonts."""
+    if not segments:
+        return 0
+    full_m = QtGui.QFontMetrics(full_font)
+    label_m = QtGui.QFontMetrics(label_font)
+    total = 0
+    for text, is_full in segments:
+        if not text:
+            continue
+        total += (full_m if is_full else label_m).horizontalAdvance(text)
+        if is_full and faux_bold:
+            total += 1  # 1px double-draw expands the glyph
+    return total
+
+
+def _draw_mixed_text(painter, x, y, segments, full_font, label_font, fill_color,
+                     glow=False, glow_color="#FFFFFF", faux_bold=False):
+    """Draw sequential text segments with full-size vs label (smaller) fonts.
+
+    Both fonts are expected to be the same face/weight (e.g. Gotham Black);
+    label_font is typically 1px smaller. drawText uses baseline y so smaller
+    labels sit on the same baseline as full-size glyphs.
+
+    When faux_bold is True (legacy single-weight faces), full-size segments are
+    drawn twice with a 1px horizontal offset so they read heavier.
+    """
+    cx = float(x)
+    for text, is_full in segments:
+        if not text:
+            continue
+        font = full_font if is_full else label_font
+        painter.setFont(font)
+        ix = int(round(cx))
+        do_faux = bool(is_full and faux_bold)
+        if glow:
+            _draw_text_glow(painter, ix, y, text, fill_color, glow_color)
+            if do_faux:
+                _draw_text_glow(painter, ix + 1, y, text, fill_color, glow_color)
+        else:
+            painter.setPen(QtGui.QColor(fill_color))
+            painter.drawText(ix, y, text)
+            if do_faux:
+                painter.drawText(ix + 1, y, text)
+        cx += QtGui.QFontMetrics(font).horizontalAdvance(text)
+        if do_faux:
+            cx += 1
 
 
 def _parse_catt(catt):
@@ -740,9 +1526,13 @@ def _parse_passing_athletes(boxscore_players, team_id):
                     continue
                 athlete = ath.get("athlete") or {}
                 last = _qb_last_name(athlete)
+                jersey = _athlete_jersey(athlete)
+                segs = _qb_line_segments(last, yds, td, inter, jersey)
                 qbs.append({
                     "name": last,
-                    "line": _format_qb_line(last, completes, yds, td, inter),
+                    "jersey": jersey,
+                    "line": _format_qb_line(last, yds, td, inter, jersey),
+                    "segments": segs,
                     "attempts": attempts,
                     "scope": "game",
                 })
@@ -796,21 +1586,13 @@ def _season_qbs_from_competitors(comp, team_id):
                     continue
                 athlete = lead.get("athlete") or {}
                 last = _qb_last_name(athlete)
-                if completes:
-                    line = _format_qb_line(last, completes, yds, td, inter)
-                else:
-                    # Fallback when leader text has yards/TD only
-                    bits = [f"QB: {last}"]
-                    if yds and yds != "0":
-                        bits.append(f"{yds}yd")
-                    if td and td != "0":
-                        bits.append(f"{td} TD")
-                    if inter and inter != "0":
-                        bits.append(f"{inter} Int")
-                    line = " ".join(bits)
+                jersey = _athlete_jersey(athlete)
+                segs = _qb_line_segments(last, yds, td, inter, jersey)
                 qbs.append({
                     "name": last,
-                    "line": line,
+                    "jersey": jersey,
+                    "line": _format_qb_line(last, yds, td, inter, jersey),
+                    "segments": segs,
                     "attempts": attempts or QB_MIN_ATTEMPTS,
                     "scope": "season",
                 })
@@ -826,23 +1608,30 @@ def _situation_fields(situation, status_type):
         "possession_id": "",
         "clock": "",
         "period": "",
+        "away_timeouts": None,
+        "home_timeouts": None,
     }
     if not situation:
         return out
     dd = (situation.get("downDistanceText")
           or situation.get("shortDownDistanceText")
           or "")
-    if not dd:
+    if not _clean_down_distance(dd):
         down = situation.get("down")
         dist = situation.get("distance")
-        if down and dist is not None:
-            dd = f"{_ordinal_down(down)} & {dist}"
-    out["down_distance"] = dd
+        ordinal = _ordinal_down(down)
+        try:
+            dist_n = int(dist)
+        except (TypeError, ValueError):
+            dist_n = 0
+        dd = f"{ordinal} & {dist_n}" if ordinal and dist_n > 0 else ""
+    out["down_distance"] = _clean_down_distance(dd)
 
-    poss_text = situation.get("possessionText") or ""
-    if poss_text:
-        out["ball_on"] = f"Ball on {poss_text}"
+    # Raw yard spot ("NYG 45"); the card composes "2nd & 22 @ NYG 45".
+    out["ball_on"] = (situation.get("possessionText") or "").strip()
     out["possession_id"] = str(situation.get("possession") or "")
+    out["away_timeouts"] = _timeout_remaining(situation.get("awayTimeouts"))
+    out["home_timeouts"] = _timeout_remaining(situation.get("homeTimeouts"))
 
     last = situation.get("lastPlay") or {}
     if isinstance(last, dict):
@@ -854,6 +1643,26 @@ def _situation_fields(situation, status_type):
     detail = (status_type or {}).get("shortDetail") or (status_type or {}).get("detail") or ""
     out["clock"] = detail
     return out
+
+
+def _live_situation_line(down, ball_on):
+    """Down and spot for the live center, e.g. '2nd & 22 @ NYG 45'.
+
+    ESPN downDistanceText often already ends with 'at NYG 47'. Drop that
+    clause and keep the '@ NYG 47' spot.
+    """
+    down = (down or "").strip()
+    spot = (ball_on or "").strip()
+    if spot.lower().startswith("ball on "):
+        spot = spot[8:].strip()
+    if down and spot:
+        down = re.sub(r"\s+at\s+.+$", "", down, count=1, flags=re.IGNORECASE).strip()
+        return f"{down} @ {spot}" if down else f"@ {spot}"
+    if down:
+        return down
+    if spot:
+        return f"@ {spot}"
+    return ""
 
 
 def _last_play_from_drives(summary):
@@ -991,15 +1800,20 @@ def _parse_event(event, summary=None):
             "city": loc or get_team_city(full),
             "score": c.get("score") or "0",
             "record": rec,
+            "lines": _competitor_lines(c),
         }
 
     a = _team_bits(away)
     h = _team_bits(home)
-    situation = comp.get("situation")
+    board_situation = comp.get("situation") or {}
+    situation = board_situation
     if summary:
         header_comps = ((summary.get("header") or {}).get("competitions") or [])
         if header_comps and header_comps[0].get("situation"):
-            situation = header_comps[0].get("situation")
+            situation = dict(header_comps[0].get("situation") or {})
+            for key in ("homeTimeouts", "awayTimeouts"):
+                if situation.get(key) is None and board_situation.get(key) is not None:
+                    situation[key] = board_situation.get(key)
 
     sit = _situation_fields(situation, stype)
     if not sit["last_play"] and summary:
@@ -1011,6 +1825,8 @@ def _parse_event(event, summary=None):
         sit["last_play"] = ""
         sit["ball_on"] = ""
         sit["possession_id"] = ""
+        sit["away_timeouts"] = None
+        sit["home_timeouts"] = None
 
     # Kickoff time for scheduled
     start = comp.get("date") or event.get("date") or ""
@@ -1050,13 +1866,13 @@ def _parse_event(event, summary=None):
                     if attempts and attempts < QB_MIN_ATTEMPTS:
                         continue
                     last = _qb_last_name(ath)
-                    if completes:
-                        line = _format_qb_line(last, completes, yds, td, inter)
-                    else:
-                        line = f"QB: {last} {lead.get('displayValue') or ''}".strip()
+                    jersey = _athlete_jersey(ath)
+                    segs = _qb_line_segments(last, yds, td, inter, jersey)
                     entry = {
                         "name": last,
-                        "line": line,
+                        "jersey": jersey,
+                        "line": _format_qb_line(last, yds, td, inter, jersey),
+                        "segments": segs,
                         "attempts": attempts or QB_MIN_ATTEMPTS,
                         "scope": "season",
                     }
@@ -1080,6 +1896,8 @@ def _parse_event(event, summary=None):
         "home_abbr": h["abbr"],
         "away_score": a["score"],
         "home_score": h["score"],
+        "away_lines": a["lines"],
+        "home_lines": h["lines"],
         "away_record": a["record"],
         "home_record": h["record"],
         "away_qbs": away_qbs,
@@ -1088,6 +1906,8 @@ def _parse_event(event, summary=None):
         "ball_on": sit["ball_on"],
         "last_play": sit["last_play"],
         "possession_id": sit["possession_id"],
+        "away_timeouts": sit["away_timeouts"],
+        "home_timeouts": sit["home_timeouts"],
         "kickoff": kickoff_local,
         "start": start,
         "scoring_plays": scoring_plays,
@@ -1102,12 +1922,18 @@ def fetch_nfl_games(settings=None):
     if not events:
         return []
 
-    # Decide which need summary enrichment
+    # Live games need a fresh summary every poll (QB line, last play).
+    # Finals are fetched once and reused. Scheduled games stay on the scoreboard.
     need_summary = []
     for e in events:
         st = ((e.get("status") or {}).get("type") or {}).get("state")
-        if st in ("in", "post"):
-            need_summary.append(str(e.get("id")))
+        eid = str(e.get("id"))
+        if st == "in":
+            need_summary.append(eid)
+        elif st == "post":
+            with _FINAL_SUMMARY_LOCK:
+                if eid not in _FINAL_SUMMARY_CACHE:
+                    need_summary.append(eid)
 
     summaries = {}
     if need_summary:
@@ -1125,10 +1951,23 @@ def fetch_nfl_games(settings=None):
                 if sm:
                     summaries[eid] = sm
 
+    for e in events:
+        eid = str(e.get("id"))
+        st = ((e.get("status") or {}).get("type") or {}).get("state")
+        sm = summaries.get(eid)
+        if st == "post" and sm is not None:
+            with _FINAL_SUMMARY_LOCK:
+                _FINAL_SUMMARY_CACHE[eid] = sm
+
     games = []
     for e in events:
         eid = str(e.get("id"))
-        g = _parse_event(e, summaries.get(eid))
+        st = ((e.get("status") or {}).get("type") or {}).get("state")
+        summary = summaries.get(eid)
+        if summary is None and st == "post":
+            with _FINAL_SUMMARY_LOCK:
+                summary = _FINAL_SUMMARY_CACHE.get(eid)
+        g = _parse_event(e, summary)
         if g:
             games.append(g)
             _dbg(f"parsed {_abbrev_game(g)}")
@@ -1190,10 +2029,26 @@ def _fit_lines(text, metrics, max_w, max_lines=2):
     return [x for x in result if x]
 
 
-def _pick_qb_line(qbs, rotate_index):
+def _pick_qb_entry(qbs, rotate_index):
     if not qbs:
-        return ""
-    return qbs[rotate_index % len(qbs)]["line"]
+        return None
+    return qbs[rotate_index % len(qbs)]
+
+
+def _pick_qb_line(qbs, rotate_index):
+    entry = _pick_qb_entry(qbs, rotate_index)
+    return entry["line"] if entry else ""
+
+
+def _pick_qb_segments(qbs, rotate_index):
+    entry = _pick_qb_entry(qbs, rotate_index)
+    if not entry:
+        return []
+    segs = entry.get("segments")
+    if segs:
+        return segs
+    line = entry.get("line") or ""
+    return [(line, False)] if line else []
 
 
 # ---------------------------------------------------------------------------
@@ -1218,56 +2073,72 @@ def _approx_blur_pixmap(pm, strength=3):
     )
 
 
-def _draw_text_glow(painter, x, y, text, fill_color, glow_color):
-    """Soft diffuse halo *behind* text, then crisp fill on top (no bold edge)."""
-    fm = painter.fontMetrics()
+_GLOW_LAYER_CACHE = {}
+
+
+def _text_glow_layers(font, text, glow_color):
+    """Bloom images for this text. Team names repeat every refresh, so cache them."""
+    gc = QtGui.QColor(glow_color)
+    key = (
+        text,
+        font.family(),
+        int(font.pixelSize()),
+        int(font.weight()),
+        bool(font.bold()),
+        gc.rgba(),
+    )
+    with _IMAGE_CACHE_LOCK:
+        cached = _GLOW_LAYER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    fm = QtGui.QFontMetrics(font)
     br = fm.tightBoundingRect(text)
     if br.width() <= 0 or br.height() <= 0:
         br = fm.boundingRect(text)
     pad = _GLOW_TEXT_PAD
     tw = max(1, br.width() + pad * 2)
     th = max(1, br.height() + pad * 2)
-    # Local origin: text baseline maps to (ox, oy) inside the offscreen layer
     ox = pad - br.x()
-    oy = pad - br.top()  # tightBoundingRect.top() is usually negative
+    oy = pad - br.top()
 
-    glow = QtGui.QPixmap(tw, th)
-    glow.fill(QtCore.Qt.transparent)
+    glow = _blank_image(tw, th)
     gp = QtGui.QPainter(glow)
     gp.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
     gp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    font = painter.font()
     path = QtGui.QPainterPath()
     path.addText(float(ox), float(oy), font, text)
-
-    gc = QtGui.QColor(glow_color)
-    # Fat soft underlay (wide stroke, low alpha) — expands silhouette for blur.
-    # Not 1px rings: width is large so after heavy blur it reads as light bleed.
     for width, alpha in ((10, 70), (6, 110)):
         pen = QtGui.QPen(QtGui.QColor(gc.red(), gc.green(), gc.blue(), alpha))
         pen.setWidth(width)
         pen.setJoinStyle(QtCore.Qt.RoundJoin)
         pen.setCapStyle(QtCore.Qt.RoundCap)
         gp.strokePath(path, pen)
-    # Soft core (below full opacity so blur doesn't leave a hard glyph stamp)
     core = QtGui.QColor(gc.red(), gc.green(), gc.blue(), 180)
     gp.fillPath(path, core)
     gp.end()
 
-    # Aggressive multi-pass blur → real bloom, not a tight outline
     bloom = _approx_blur_pixmap(glow, strength=8)
     bloom = _approx_blur_pixmap(bloom, strength=6)
     bloom = _approx_blur_pixmap(bloom, strength=4)
+    wide = _approx_blur_pixmap(bloom, strength=7)
+    layers = (bloom, wide, ox, oy)
+    with _IMAGE_CACHE_LOCK:
+        if len(_GLOW_LAYER_CACHE) > 400:
+            _GLOW_LAYER_CACHE.clear()
+        _GLOW_LAYER_CACHE[key] = layers
+    return layers
 
+
+def _draw_text_glow(painter, x, y, text, fill_color, glow_color):
+    """Soft diffuse halo *behind* text, then crisp fill on top (no bold edge)."""
+    bloom, wide, ox, oy = _text_glow_layers(painter.font(), text, glow_color)
     bx = int(x - ox)
     by = int(y - oy)
-    # Outer wider/dimmer pass first (background depth)
-    wide = _approx_blur_pixmap(bloom, strength=7)
     painter.setOpacity(0.28)
-    painter.drawPixmap(bx, by, wide)
-    # Main bloom behind the glyph at moderate opacity
+    painter.drawImage(bx, by, wide)
     painter.setOpacity(0.40)
-    painter.drawPixmap(bx, by, bloom)
+    painter.drawImage(bx, by, bloom)
     painter.setOpacity(1.0)
 
     # Crisp original on top — unchanged size/weight (no near-offset fill copies)
@@ -1278,10 +2149,9 @@ def _draw_text_glow(painter, x, y, text, fill_color, glow_color):
 def _make_white_silhouette(pixmap):
     if pixmap is None or pixmap.isNull():
         return None
-    sil = QtGui.QPixmap(pixmap.size())
-    sil.fill(QtCore.Qt.transparent)
+    sil = _blank_image(pixmap.width(), pixmap.height())
     sp = QtGui.QPainter(sil)
-    sp.drawPixmap(0, 0, pixmap)
+    sp.drawImage(0, 0, pixmap)
     sp.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)
     sp.fillRect(sil.rect(), QtGui.QColor(255, 255, 255, 255))
     sp.end()
@@ -1294,15 +2164,14 @@ def _draw_logo_white_glow(painter, x, y, pixmap):
         return
     sil = _make_white_silhouette(pixmap)
     if sil is None:
-        painter.drawPixmap(x, y, pixmap)
+        painter.drawImage(x, y, pixmap)
         return
     w, h = pixmap.width(), pixmap.height()
     pad = _GLOW_BLOOM_PAD
     # Slight enlarge so bloom peeks past edges without a heavy halo
     big_w = int(w * 1.22) + pad * 2
     big_h = int(h * 1.22) + pad * 2
-    layer = QtGui.QPixmap(big_w, big_h)
-    layer.fill(QtCore.Qt.transparent)
+    layer = _blank_image(big_w, big_h)
     lp = QtGui.QPainter(layer)
     scaled = sil.scaled(
         int(w * 1.15), int(h * 1.15),
@@ -1310,7 +2179,7 @@ def _draw_logo_white_glow(painter, x, y, pixmap):
     )
     sx = (big_w - scaled.width()) // 2
     sy = (big_h - scaled.height()) // 2
-    lp.drawPixmap(sx, sy, scaled)
+    lp.drawImage(sx, sy, scaled)
     lp.end()
     bloom = _approx_blur_pixmap(layer, strength=4)
     bloom = _approx_blur_pixmap(bloom, strength=3)
@@ -1318,16 +2187,51 @@ def _draw_logo_white_glow(painter, x, y, pixmap):
     bx = x + (w - bloom.width()) // 2
     by = y + (h - bloom.height()) // 2
     painter.setOpacity(0.18)
-    painter.drawPixmap(bx, by, bloom)
+    painter.drawImage(bx, by, bloom)
     painter.setOpacity(0.09)
     wider = _approx_blur_pixmap(bloom, strength=2)
-    painter.drawPixmap(
+    painter.drawImage(
         x + (w - wider.width()) // 2,
         y + (h - wider.height()) // 2,
         wider,
     )
     painter.setOpacity(1.0)
-    painter.drawPixmap(x, y, pixmap)
+    painter.drawImage(x, y, pixmap)
+
+
+def _draw_timeout_bars(painter, score_x, score_w, y, remaining, bar_h, gap, mark_w,
+                       color=None):
+    """One row of three timeout dashes under a score. Filled = left, blank = used.
+
+    Slots stay put: a used timeout leaves an empty outline instead of
+    closing the gap. Filled marks match the team-name color.
+    """
+    if remaining is None:
+        return
+    try:
+        left = int(remaining)
+    except (TypeError, ValueError):
+        return
+    left = max(0, min(3, left))
+    mark_w = max(4, int(mark_w))
+    row_w = 3 * mark_w + 2 * gap
+    x0 = int(score_x + (score_w - row_w) / 2)
+    yy = int(y)
+    fill = QtGui.QColor(color) if color is not None else QtGui.QColor("#FFFFFF")
+    used = QtGui.QColor(fill)
+    used.setAlpha(80)
+    for i in range(3):
+        xx = int(x0 + i * (mark_w + gap))
+        if i < left:
+            painter.fillRect(xx, yy, mark_w, bar_h, fill)
+        else:
+            # Same box as a filled dash. A stroked rect sits off that plane.
+            painter.fillRect(xx, yy, mark_w, 1, used)
+            if bar_h > 1:
+                painter.fillRect(xx, yy + bar_h - 1, mark_w, 1, used)
+            if bar_h > 2:
+                painter.fillRect(xx, yy, 1, bar_h, used)
+                painter.fillRect(xx + mark_w - 1, yy, 1, bar_h, used)
 
 
 def _draw_icon_glow(painter, x, y, pixmap):
@@ -1336,7 +2240,7 @@ def _draw_icon_glow(painter, x, y, pixmap):
         return
     sil = _make_white_silhouette(pixmap)
     if sil is None:
-        painter.drawPixmap(x, y, pixmap)
+        painter.drawImage(x, y, pixmap)
         return
     w, h = pixmap.width(), pixmap.height()
     big = sil.scaled(
@@ -1345,13 +2249,13 @@ def _draw_icon_glow(painter, x, y, pixmap):
     )
     bloom = _approx_blur_pixmap(big, strength=3)
     painter.setOpacity(0.16)
-    painter.drawPixmap(
+    painter.drawImage(
         x + (w - bloom.width()) // 2,
         y + (h - bloom.height()) // 2,
         bloom,
     )
     painter.setOpacity(1.0)
-    painter.drawPixmap(x, y, pixmap)
+    painter.drawImage(x, y, pixmap)
 
 
 def _game_visual_key(game, qb_rotate_index, settings):
@@ -1366,12 +2270,16 @@ def _game_visual_key(game, qb_rotate_index, settings):
         game.get("home_name"),
         game.get("away_score"),
         game.get("home_score"),
+        tuple(game.get("away_lines") or ()),
+        tuple(game.get("home_lines") or ()),
         game.get("down_distance"),
         game.get("ball_on"),
         game.get("last_play"),
         game.get("status_detail"),
         game.get("kickoff"),
         game.get("possession_id"),
+        game.get("away_timeouts"),
+        game.get("home_timeouts"),
         _pick_qb_line(game.get("away_qbs") or [], qb_rotate_index) if show_qb else "",
         _pick_qb_line(game.get("home_qbs") or [], qb_rotate_index) if show_qb else "",
     )
@@ -1393,10 +2301,16 @@ def build_game_card(host, game, qb_rotate_index=0):
     logo_size = max(40, int(h * 1.10))  # 2× prior (was h * 0.55)
     away_logo = get_team_logo(away_full, logo_size)
     home_logo = get_team_logo(home_full, logo_size)
-    away_logo_w = away_logo.width()
-    home_logo_w = home_logo.width()
+    away_lpad, away_rpad, away_tpad, _away_bpad, away_vis_w, away_vis_h = _logo_visual(
+        away_logo, (away_full, logo_size),
+    )
+    home_lpad, home_rpad, home_tpad, _home_bpad, home_vis_w, home_vis_h = _logo_visual(
+        home_logo, (home_full, logo_size),
+    )
 
     metrics = QtGui.QFontMetrics(host.main_font)
+    score_font = getattr(host, "score_font", host.main_font)
+    score_m = QtGui.QFontMetrics(score_font)
     small_m = QtGui.QFontMetrics(host.small_font)
     tiny_m = QtGui.QFontMetrics(host.tiny_font)
     time_m = QtGui.QFontMetrics(host.time_font)
@@ -1408,89 +2322,160 @@ def build_game_card(host, game, qb_rotate_index=0):
     glow_names = bool(settings.get("glow_team_names", False))
     glow_all = bool(settings.get("glow_all", False))
 
-    away_qb = _pick_qb_line(game.get("away_qbs") or [], qb_rotate_index) if show_qb else ""
-    home_qb = _pick_qb_line(game.get("home_qbs") or [], qb_rotate_index) if show_qb else ""
+    away_qb_segs = _pick_qb_segments(game.get("away_qbs") or [], qb_rotate_index) if show_qb else []
+    home_qb_segs = _pick_qb_segments(game.get("home_qbs") or [], qb_rotate_index) if show_qb else []
+    away_qb = "".join(t for t, _ in away_qb_segs)
+    home_qb = "".join(t for t, _ in home_qb_segs)
 
     away_name_w = metrics.horizontalAdvance(away_label)
     home_name_w = metrics.horizontalAdvance(home_label)
-    away_qb_w = small_m.horizontalAdvance(away_qb) if away_qb else 0
-    home_qb_w = small_m.horizontalAdvance(home_qb) if home_qb else 0
+    bold_small = getattr(host, "small_font_bold", host.small_font)  # Gotham Black full size
+    regular_small = getattr(host, "small_font_regular", host.small_font)  # same face, size-1
+    qb_faux = bool(getattr(host, "qb_faux_bold", False))
+    away_qb_w = _qb_segments_width(away_qb_segs, bold_small, regular_small, qb_faux) if away_qb_segs else 0
+    home_qb_w = _qb_segments_width(home_qb_segs, bold_small, regular_small, qb_faux) if home_qb_segs else 0
     away_block = max(away_name_w, away_qb_w)
     home_block = max(home_name_w, home_qb_w)
     sym = max(away_block, home_block)
     away_block = home_block = sym
 
     state = game.get("state")
+    status_detail = (game.get("status_detail") or "").strip()
+    break_heading = _break_heading(game) if state in ("in", "post") else ""
+    linescore = None
+    if break_heading:
+        linescore = _prepare_linescore(
+            getattr(host, "situation_font", host.small_font),
+            game,
+            h,
+            heading=break_heading,
+            heading_font=host.time_font,
+        )
     show_scores = state in ("in", "post")
     away_score = str(game.get("away_score") or "0") if show_scores else ""
     home_score = str(game.get("home_score") or "0") if show_scores else ""
-    away_score_w = metrics.horizontalAdvance(away_score) if away_score else 0
-    home_score_w = metrics.horizontalAdvance(home_score) if home_score else 0
+    away_score_w = score_m.horizontalAdvance(away_score) if away_score else 0
+    home_score_w = score_m.horizontalAdvance(home_score) if home_score else 0
 
     down = (game.get("down_distance") or "").strip()
     ball_on = (game.get("ball_on") or "").strip() if show_ball else ""
     last_play = (game.get("last_play") or "").strip() if show_lp else ""
-    status_detail = (game.get("status_detail") or "").strip()
 
-    # center_kind: "time" (kickoff/clock) uses smaller time_font; "main" uses vs_font
+    # Pregame / final keep the short center. Live games stack clock, down, play.
+    vs_m = QtGui.QFontMetrics(host.vs_font)
+    sit_font = sit_m = play_font = play_m = None
+    center_gap = 1
+    center_items = []
     center_kind = "main"
+    center_main = ""
+    center_sub = ""
     if state == "pre":
         center_main = game.get("kickoff") or status_detail or "vs"
         center_kind = "time"
         center_sub = "vs"
-        down = ""
-        ball_on = ""
-        last_play = ""
+    elif linescore:
+        center_main_w = linescore["width"]
     elif state == "post":
         center_main = "F"
         center_sub = status_detail if status_detail.lower() != "final" else ""
-        last_play = ""  # finals: hide last-play under score
-        ball_on = ""
     else:
-        if down:
-            center_main = down
-        else:
-            center_main = status_detail or ""
-            center_kind = "time"
-        center_sub = ball_on
+        # LED time face has no readable lowercase ( "1st" draws as "1SC" ).
+        clock_text = status_detail.upper()
+        situation_line = _live_situation_line(down, ball_on)
+        play_text = last_play.upper()
+        play_wrap_w = max(220, int(h * 3.8))
+        sit_font = QtGui.QFont(host.situation_font)
+        play_font = QtGui.QFont(host.play_font)
+        sit_px = sit_font.pixelSize()
+        play_px = play_font.pixelSize()
+        if sit_px < 1:
+            sit_px = max(10, int(h * 0.20))
+        if play_px < 1:
+            play_px = max(6, int(h * 0.145) - 2)
+        lp_lines = []
+        while True:
+            sit_font.setPixelSize(sit_px)
+            play_font.setPixelSize(play_px)
+            sit_m = QtGui.QFontMetrics(sit_font)
+            play_m = QtGui.QFontMetrics(play_font)
+            lp_lines = _fit_lines(play_text, play_m, play_wrap_w, 2) if play_text else []
+            plan = _live_center_rows(
+                h, time_m, sit_m, play_m, clock_text, situation_line, lp_lines,
+            )
+            if plan["reserved"] <= h:
+                break
+            shrunk = False
+            if play_px > 7:
+                play_px -= 1
+                shrunk = True
+            if sit_px > max(8, play_px + 1):
+                sit_px -= 1
+                shrunk = True
+            if not shrunk:
+                break
+        center_main_w = 40
+        if clock_text:
+            center_main_w = max(center_main_w, time_m.horizontalAdvance(clock_text))
+        if situation_line:
+            center_main_w = max(center_main_w, sit_m.horizontalAdvance(situation_line))
+        for ln in lp_lines:
+            center_main_w = max(center_main_w, play_m.horizontalAdvance(ln))
+        center_main_w = max(int(center_main_w), 48)
+        center_gap = 1
+        if clock_text:
+            center_items.append(("time", clock_text))
+        if situation_line:
+            center_items.append(("sit", situation_line))
+        for ln in lp_lines:
+            center_items.append(("play", ln))
 
-    vs_m = QtGui.QFontMetrics(host.vs_font)
-    _center_fm = time_m if center_kind == "time" else vs_m
-    center_main_w = max(
-        _center_fm.horizontalAdvance(center_main) if center_main else 0,
-        small_m.horizontalAdvance(center_sub) if center_sub else 0,
-        40,
-    )
-    # Last-play band spans scores + center (pregame: center only)
-    lp_band_w = away_score_w + 8 + center_main_w + 8 + home_score_w
-    lp_lines = _fit_lines(last_play, tiny_m, max(60, lp_band_w), 2) if last_play else []
-
-    # Extra center width if last-play / ball-on need room
-    for ln in lp_lines:
-        center_main_w = max(center_main_w, tiny_m.horizontalAdvance(ln) - away_score_w - home_score_w - 16)
-    center_main_w = max(center_main_w, 48)
+    if state != "in" and not linescore:
+        _center_fm = time_m if center_kind == "time" else vs_m
+        center_main_w = max(
+            _center_fm.horizontalAdvance(center_main) if center_main else 0,
+            small_m.horizontalAdvance(center_sub) if center_sub else 0,
+            40,
+        )
+        center_main_w = max(center_main_w, 48)
+        if center_main:
+            center_items.append((center_kind, center_main))
+        if center_sub:
+            center_items.append(("sub", center_sub))
 
     pad = 8
-    gap_name_logo = 5
-    gap_logo_score = 12
+    # Same ink-to-ink gap: name ↔ logo ↔ score (logos have uneven canvas pad).
+    gap_name_logo = 10
+    gap_logo_score = 10
     gap_score_center = 8
+    poss_pad = 4
+    poss_icon = None
+    away_has_ball = False
+    home_has_ball = False
+    if show_poss and state == "in" and game.get("possession_id"):
+        poss_id = str(game.get("possession_id"))
+        poss_icon = get_football_icon(max(12, int(h * 0.26)))
+        away_has_ball = poss_id == str(game.get("away_id"))
+        home_has_ball = poss_id == str(game.get("home_id"))
+    poss_icon_w = poss_icon.width() if poss_icon is not None else 0
+    away_inside = (poss_pad + poss_icon_w) if away_has_ball else 0
+    home_inside = (poss_pad + poss_icon_w) if home_has_ball else 0
     # Pregame: no score digits — logo sits closer to kickoff/vs center
     gap_logo_center = gap_logo_score if not show_scores else gap_logo_score
 
     if show_scores:
         total_w = (
-            pad + away_block + gap_name_logo + away_logo_w + gap_logo_score
-            + away_score_w + gap_score_center + center_main_w + gap_score_center
-            + home_score_w + gap_logo_score + home_logo_w + gap_name_logo
-            + home_block + pad
+            pad + away_block + gap_name_logo + away_vis_w + gap_logo_score
+            + away_score_w + away_inside + gap_score_center + center_main_w
+            + gap_score_center + home_inside + home_score_w + gap_logo_score
+            + home_vis_w + gap_name_logo + home_block + pad
         )
     else:
         total_w = (
-            pad + away_block + gap_name_logo + away_logo_w + gap_logo_center
+            pad + away_block + gap_name_logo + away_vis_w + gap_logo_center
             + center_main_w + gap_logo_center
-            + home_logo_w + gap_name_logo + home_block + pad
+            + home_vis_w + gap_name_logo + home_block + pad
         )
-    # Inter-card gap is applied in NFLTicker._compose_strip (fixed, MLB-like),
+    # Inter-card gap is applied in _compose_strip_image (fixed, MLB-like),
     # not as trailing pixels on the card — keeps spacing even for pre/live/final.
 
     phys_w = max(1, int(total_w * dpr))
@@ -1507,14 +2492,11 @@ def build_game_card(host, game, qb_rotate_index=0):
     # must use actual pixmap height, not the request box (that sat names too low).
     qb_ascent = small_m.ascent()
     has_qb = bool(away_qb or home_qb)
-    away_logo_h = max(1, away_logo.height())
-    home_logo_h = max(1, home_logo.height())
-    away_logo_y = (h - away_logo_h) // 2
-    home_logo_y = (h - home_logo_h) // 2
-    # Shared name baseline from the taller logo row (both teams align).
-    row_logo_h = max(away_logo_h, home_logo_h)
-    row_logo_y = (h - row_logo_h) // 2
-    logo_mid = row_logo_y + row_logo_h / 2.0
+    # Center on the visible mark, not the transparent canvas.
+    away_logo_y = int(round((h - away_vis_h) / 2.0 - away_tpad))
+    home_logo_y = int(round((h - home_vis_h) / 2.0 - home_tpad))
+    row_logo_h = max(away_vis_h, home_vis_h)
+    logo_mid = h / 2.0
     cap = metrics.capHeight()
     if cap <= 0:
         cap = -metrics.tightBoundingRect("ABCDEFGHIJKLMNOPQRSTUVWXYZ").top()
@@ -1526,7 +2508,7 @@ def build_game_card(host, game, qb_rotate_index=0):
     if not getattr(host, "_logged_card_align", False):
         host._logged_card_align = True
         print(
-            f"[CARD] align h={h} box={logo_size} pixmap={away_logo_h}x{home_logo_h} "
+            f"[CARD] align h={h} box={logo_size} ink={away_vis_h}x{home_vis_h} "
             f"logo_y={away_logo_y}/{home_logo_y} logo_mid={logo_mid:.1f} "
             f"cap={int(cap)} name_y={name_y} name_vis_mid={name_y - cap / 2.0:.1f} "
             f"qb_y={qb_y}",
@@ -1544,149 +2526,226 @@ def build_game_card(host, game, qb_rotate_index=0):
     else:
         painter.setPen(away_color)
         painter.drawText(_nx, name_y, away_label)
-    if qb_y is not None and away_qb:
-        painter.setFont(host.small_font)
+    if qb_y is not None and away_qb_segs:
         _qx = x + away_block - away_qb_w
-        if glow_all:
-            _draw_text_glow(painter, _qx, qb_y, away_qb, "#BDBDBD", "#FFFFFF")
-        else:
-            painter.setPen(QtGui.QColor("#BDBDBD"))
-            painter.drawText(_qx, qb_y, away_qb)
-    x += away_block + gap_name_logo
-
+        _draw_mixed_text(
+            painter, _qx, qb_y, away_qb_segs, bold_small, regular_small,
+            "#BDBDBD", glow=glow_all, glow_color="#FFFFFF", faux_bold=qb_faux,
+        )
+    x += away_block + gap_name_logo - _text_right_slack(metrics, away_label, away_name_w)
+    away_logo_x = x - away_lpad
     if glow_all:
-        _draw_logo_white_glow(painter, x, away_logo_y, away_logo)
+        _draw_logo_white_glow(painter, away_logo_x, away_logo_y, away_logo)
     else:
-        painter.drawPixmap(x, away_logo_y, away_logo)
-    x += away_logo_w + (gap_logo_score if show_scores else gap_logo_center)
+        painter.drawImage(away_logo_x, away_logo_y, away_logo)
+    x += away_vis_w + (gap_logo_score if show_scores else gap_logo_center)
+    if show_scores:
+        x -= _text_left_slack(score_m, away_score)
 
-    # Away score (live / final only — blank for pregame)
-    score_y = name_y
+    # Away score (live / final only — blank for pregame).
+    # Same optical center as the team name, on the larger score face.
+    score_cap = score_m.capHeight()
+    if score_cap <= 0:
+        score_cap = -score_m.tightBoundingRect("0123456789").top()
+    if score_cap <= 0:
+        score_cap = score_m.ascent()
+    score_y = int(round((name_y - cap / 2.0) + score_cap / 2.0))
+    to_bar_h = max(2, int(round(h * 0.04)))
+    to_gap = max(4, to_bar_h)
+    digit_w = max(8, score_m.horizontalAdvance("0"))
+    to_mark_w = max(4, (int(digit_w) - 2 * to_gap) // 3)
+    ink = score_m.tightBoundingRect("08")
+    timeout_y = score_y + max(1, ink.bottom()) + 3
+    if timeout_y + to_bar_h > h - 1:
+        timeout_y = max(0, h - 1 - to_bar_h)
+
+    def _paint_poss(ix):
+        iy = int(round(score_y - score_cap / 2.0 - poss_icon.height() / 2.0))
+        iy = max(0, min(h - poss_icon.height(), iy))
+        if glow_all:
+            _draw_icon_glow(painter, ix, iy, poss_icon)
+        else:
+            painter.drawImage(ix, iy, poss_icon)
+
+    def _paint_timeouts(score_x, score_w, remaining, color):
+        if state != "in":
+            return
+        _draw_timeout_bars(
+            painter, score_x, score_w, timeout_y, remaining, to_bar_h, to_gap,
+            to_mark_w, color,
+        )
+
     away_score_x = x
     if show_scores:
-        painter.setFont(host.main_font)
+        painter.setFont(score_font)
         if glow_all:
             _draw_text_glow(painter, x, score_y, away_score, "#FFFFFF", "#FFFFFF")
         else:
             painter.setPen(QtGui.QColor("#FFFFFF"))
             painter.drawText(x, score_y, away_score)
-        x += away_score_w + gap_score_center
+        _paint_timeouts(away_score_x, away_score_w, game.get("away_timeouts"), away_color)
+        x += away_score_w
+        if away_has_ball:
+            x += poss_pad
+            _paint_poss(x)
+            x += poss_icon_w
+        x += gap_score_center
     else:
         away_score_x = x  # center starts immediately after logo gap
 
-    # Center column
+    # Center column — live: clock / down@spot / play, all between the scores.
     center_left = x
     center_w = center_main_w
-    # Stack: main/time (down/F/kickoff/clock), sub (ball on / vs), last play lines
-    center_items = []
-    if center_main:
-        center_items.append((center_kind, center_main))
-    if center_sub:
-        center_items.append(("sub", center_sub))
-    for ln in lp_lines:
-        center_items.append(("lp", ln))
 
-    if center_items:
-        item_heights = []
-        for kind, _ in center_items:
-            if kind == "time":
-                item_heights.append(time_m.ascent() + time_m.descent())
-            elif kind == "main":
-                item_heights.append(vs_m.ascent() + vs_m.descent())
-            elif kind == "sub":
-                item_heights.append(small_m.ascent() + small_m.descent())
-            else:
-                item_heights.append(tiny_m.ascent() + tiny_m.descent())
-        gap_c = 1
-        stack_h = sum(item_heights) + gap_c * (len(item_heights) - 1)
-        cy = (h - stack_h) // 2
+    if linescore:
+        _draw_linescore(
+            painter, center_left, center_w, h, linescore, away_color, home_color,
+        )
+    elif center_items:
+        live_clock = state == "in" and any(k == "time" for k, _ in center_items)
+        live_rows = None
+        if live_clock:
+            clock_text = next((t for k, t in center_items if k == "time"), "")
+            sit_text = next((t for k, t in center_items if k == "sit"), "")
+            play_lines = [t for k, t in center_items if k == "play"]
+            live_rows = _live_center_rows(
+                h, time_m, sit_m, play_m, clock_text, sit_text, play_lines,
+            )
+        else:
+            item_metrics = []
+            for kind, text in center_items:
+                if kind == "main":
+                    fm = vs_m
+                elif kind == "sub":
+                    fm = small_m
+                elif kind == "time":
+                    fm = time_m
+                else:
+                    fm = small_m
+                item_metrics.append(_glyph_line(fm, text))
+            stack_h = (
+                sum(hgt for hgt, _ in item_metrics)
+                + center_gap * (len(item_metrics) - 1)
+            )
+            cy = (h - stack_h) // 2
+        clock_blue = live_clock and _clock_over_two_minutes(
+            next((t for k, t in center_items if k == "time"), "")
+        )
+        play_i = 0
         for i, (kind, text) in enumerate(center_items):
             if kind == "time":
                 painter.setFont(host.time_font)
-                tw = time_m.horizontalAdvance(text)
-                tx = center_left + (center_w - tw) // 2
-                ty = cy + time_m.ascent()
-                if glow_all:
-                    _draw_text_glow(painter, tx, ty, text, "#FFFFFF", "#FFFFFF")
+                fm = time_m
+                if _clock_under_two_minutes(text):
+                    fill = "#FFD700"
+                elif clock_blue:
+                    fill = "#00BFFF"
                 else:
-                    painter.setPen(QtGui.QColor("#FFFFFF"))
-                    painter.drawText(tx, ty, text)
-                cy += item_heights[i] + gap_c
+                    fill = "#FFFFFF"
             elif kind == "main":
                 painter.setFont(host.vs_font)
+                fm = vs_m
                 fill = "#FFD700" if state == "post" else "#FFFFFF"
-                tw = vs_m.horizontalAdvance(text)
-                tx = center_left + (center_w - tw) // 2
-                ty = cy + vs_m.ascent()
-                if glow_all:
+            elif kind == "sub":
+                painter.setFont(host.small_font)
+                fm = small_m
+                fill = "#A0A0A0"
+            elif kind == "sit":
+                painter.setFont(sit_font)
+                fm = sit_m
+                fill = "#00BFFF" if clock_blue else "#FFFFFF"
+            else:
+                painter.setFont(play_font)
+                fm = play_m
+                fill = "#D0D0D0"
+            if live_rows is not None:
+                if kind == "time":
+                    top, vis_ascent = live_rows["time"]
+                elif kind == "sit":
+                    top, vis_ascent = live_rows["sit"]
+                else:
+                    slot = "play" if play_i == 0 else "play2"
+                    play_i += 1
+                    top, vis_ascent = live_rows[slot]
+                ty = top + vis_ascent
+            else:
+                vis_h, vis_ascent = item_metrics[i]
+                ty = cy + vis_ascent
+                cy += vis_h + center_gap
+            tw = fm.horizontalAdvance(text)
+            tx = center_left + (center_w - tw) // 2
+            if kind == "time" and clock_blue:
+                left, dash, right = _split_clock_line(text)
+                if dash:
+                    if glow_all:
+                        _draw_text_glow(painter, tx, ty, left, "#00BFFF", "#00BFFF")
+                    else:
+                        painter.setPen(QtGui.QColor("#00BFFF"))
+                        painter.drawText(tx, ty, left)
+                    tx += fm.horizontalAdvance(left)
+                    if glow_all:
+                        _draw_text_glow(painter, tx, ty, dash, "#FFFFFF", "#FFFFFF")
+                    else:
+                        painter.setPen(QtGui.QColor("#FFFFFF"))
+                        painter.drawText(tx, ty, dash)
+                    tx += fm.horizontalAdvance(dash)
+                    if right:
+                        if glow_all:
+                            _draw_text_glow(painter, tx, ty, right, "#00BFFF", "#00BFFF")
+                        else:
+                            painter.setPen(QtGui.QColor("#00BFFF"))
+                            painter.drawText(tx, ty, right)
+                elif glow_all:
                     _draw_text_glow(painter, tx, ty, text, fill, "#FFFFFF")
                 else:
                     painter.setPen(QtGui.QColor(fill))
                     painter.drawText(tx, ty, text)
-                cy += item_heights[i] + gap_c
-            elif kind == "sub":
-                painter.setFont(host.small_font)
-                tw = small_m.horizontalAdvance(text)
-                tx = center_left + (center_w - tw) // 2
-                ty = cy + small_m.ascent()
-                if glow_all:
-                    _draw_text_glow(painter, tx, ty, text, "#A0A0A0", "#FFFFFF")
-                else:
-                    painter.setPen(QtGui.QColor("#A0A0A0"))
-                    painter.drawText(tx, ty, text)
-                cy += item_heights[i] + gap_c
+            elif kind == "sit":
+                for piece, is_mark in _sit_color_segments(text):
+                    color = "#FFFFFF" if is_mark else fill
+                    if glow_all:
+                        _draw_text_glow(painter, tx, ty, piece, color, "#FFFFFF")
+                    else:
+                        painter.setPen(QtGui.QColor(color))
+                        painter.drawText(tx, ty, piece)
+                    tx += fm.horizontalAdvance(piece)
+            elif glow_all:
+                _draw_text_glow(painter, tx, ty, text, fill, "#FFFFFF")
             else:
-                painter.setFont(host.tiny_font)
-                tw = tiny_m.horizontalAdvance(text)
-                lp_left = away_score_x
-                tx = lp_left + max(0, (lp_band_w - tw) // 2)
-                ty = cy + tiny_m.ascent()
-                if glow_all:
-                    _draw_text_glow(painter, tx, ty, text, "#BDBDBD", "#FFFFFF")
-                else:
-                    painter.setPen(QtGui.QColor("#BDBDBD"))
-                    painter.drawText(tx, ty, text)
-                cy += item_heights[i] + gap_c
+                painter.setPen(QtGui.QColor(fill))
+                painter.drawText(tx, ty, text)
 
-    x += center_w + (gap_score_center if show_scores else gap_logo_center)
+    x += center_w
+    if show_scores and home_has_ball:
+        x += gap_score_center
+        _paint_poss(x)
+        x += poss_icon_w + poss_pad
+    else:
+        x += gap_score_center if show_scores else gap_logo_center
 
     # Home score (live / final only)
     home_score_x = x
     if show_scores:
-        painter.setFont(host.main_font)
+        painter.setFont(score_font)
         if glow_all:
             _draw_text_glow(painter, x, score_y, home_score, "#FFFFFF", "#FFFFFF")
         else:
             painter.setPen(QtGui.QColor("#FFFFFF"))
             painter.drawText(x, score_y, home_score)
+        _paint_timeouts(home_score_x, home_score_w, game.get("home_timeouts"), home_color)
 
-        # Possession football under possessing team's score
-        if show_poss and state == "in" and game.get("possession_id"):
-            poss = str(game["possession_id"])
-            icon = get_football_icon(max(10, int(h * 0.18)))
-            icon_y = min(h - icon.height() - 2, score_y + 4)
-            if poss == str(game.get("away_id")):
-                ix = away_score_x + (away_score_w - icon.width()) // 2
-                if glow_all:
-                    _draw_icon_glow(painter, ix, icon_y, icon)
-                else:
-                    painter.drawPixmap(ix, icon_y, icon)
-            elif poss == str(game.get("home_id")):
-                ix = home_score_x + (home_score_w - icon.width()) // 2
-                if glow_all:
-                    _draw_icon_glow(painter, ix, icon_y, icon)
-                else:
-                    painter.drawPixmap(ix, icon_y, icon)
-
-        x += home_score_w + gap_logo_score
+        x += home_score_w + gap_logo_score - _text_right_slack(
+            score_m, home_score, home_score_w,
+        )
     else:
         x += 0  # already advanced logo-center gap above
 
+    home_logo_x = x - home_lpad
     if glow_all:
-        _draw_logo_white_glow(painter, x, home_logo_y, home_logo)
+        _draw_logo_white_glow(painter, home_logo_x, home_logo_y, home_logo)
     else:
-        painter.drawPixmap(x, home_logo_y, home_logo)
-    x += home_logo_w + gap_name_logo
+        painter.drawImage(home_logo_x, home_logo_y, home_logo)
+    x += home_vis_w + gap_name_logo - _text_left_slack(metrics, home_label)
 
     painter.setFont(host.main_font)
     if glow_names or glow_all:
@@ -1695,13 +2754,11 @@ def build_game_card(host, game, qb_rotate_index=0):
     else:
         painter.setPen(home_color)
         painter.drawText(x, name_y, home_label)
-    if qb_y is not None and home_qb:
-        painter.setFont(host.small_font)
-        if glow_all:
-            _draw_text_glow(painter, x, qb_y, home_qb, "#BDBDBD", "#FFFFFF")
-        else:
-            painter.setPen(QtGui.QColor("#BDBDBD"))
-            painter.drawText(x, qb_y, home_qb)
+    if qb_y is not None and home_qb_segs:
+        _draw_mixed_text(
+            painter, x, qb_y, home_qb_segs, bold_small, regular_small,
+            "#BDBDBD", glow=glow_all, glow_color="#FFFFFF", faux_bold=qb_faux,
+        )
 
     painter.end()
     return image
@@ -2089,12 +3146,197 @@ class SettingsDialog(QtWidgets.QDialog):
         return s
 
 
+def _layout_tuple(settings, height, dpr):
+    s = settings
+    return (
+        int(height),
+        int(s.get("game_spacing_percent", 100)),
+        int(s.get("font_scale_percent", 160)),
+        int(s.get("player_font_scale_percent", 75)),
+        s.get("font", "Ozone"),
+        s.get("player_info_font", "Gotham Black"),
+        bool(s.get("show_qb_stats", True)),
+        bool(s.get("show_last_play", True)),
+        bool(s.get("show_ball_on", True)),
+        bool(s.get("show_possession", True)),
+        bool(s.get("glow_team_names", False)),
+        bool(s.get("glow_all", False)),
+        bool(s.get("use_city_abbreviations", False)),
+        bool(s.get("show_city_only", False)),
+        bool(s.get("show_team_cities", False)),
+        round(float(dpr), 3),
+    )
+
+
+def _slate_fp(settings, games, qb_index, height, dpr):
+    layout = _layout_tuple(settings, height, dpr)
+    if not games:
+        return ("empty", layout)
+    return (
+        tuple(_game_visual_key(g, qb_index, settings) for g in games),
+        layout,
+    )
+
+
+def _poll_interval_ms(settings, games):
+    """Live games use the settings interval. Idle slates poll slowly.
+
+    A game within 10 minutes of kickoff keeps the fast interval so the
+    switch to in-progress is not late.
+    """
+    base = max(5, int(settings.get("update_interval", 15)))
+    games = games or []
+    if any(g.get("state") == "in" for g in games):
+        return base * 1000
+    now = datetime.datetime.now().astimezone()
+    for g in games:
+        if g.get("state") != "pre":
+            continue
+        start = g.get("start") or ""
+        try:
+            kick = datetime.datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            kick = kick.astimezone()
+        except Exception:
+            continue
+        delta = (kick - now).total_seconds()
+        if -120 <= delta <= _KICKOFF_SOON_SECONDS:
+            return base * 1000
+    return max(base, _IDLE_POLL_SECONDS) * 1000
+
+
+def _compose_strip_image(card_images, settings, height, dpr):
+    """Build the scrolling strip off the UI thread. Returns (QImage, period)."""
+    if not card_images:
+        return None, 0.0
+    h = int(height)
+    dpr = float(dpr)
+    space_pct = max(0, min(200, int(settings.get("game_spacing_percent", 100))))
+    space_scale = space_pct / 100.0
+    inter_gap = max(29, int(round(h * 1.80 * space_scale)))
+    widths = []
+    for img in card_images:
+        idpr = float(img.devicePixelRatio()) or dpr
+        widths.append(max(1, int(round(img.width() / idpr))))
+    n = len(widths)
+    period = sum(widths) + n * inter_gap
+    strip = QtGui.QImage(
+        max(1, int(period * 2 * dpr)),
+        max(1, int(h * dpr)),
+        QtGui.QImage.Format_ARGB32_Premultiplied,
+    )
+    strip.setDevicePixelRatio(dpr)
+    strip.fill(0)
+    p = QtGui.QPainter(strip)
+    x = 0.0
+    for _ in range(2):
+        for img, w in zip(card_images, widths):
+            p.drawImage(QtCore.QRectF(x, 0, w, h), img)
+            x += w + inter_gap
+    p.end()
+    return strip, float(period)
+
+
+def _render_strip(host, games):
+    """Paint every card and the strip. Safe off the GUI thread (QImage only)."""
+    cards = []
+    if not games:
+        img = _blank_image(int(320 * host.dpr), int(host.ticker_height * host.dpr))
+        img.setDevicePixelRatio(host.dpr)
+        p = QtGui.QPainter(img)
+        p.setFont(host.main_font)
+        p.setPen(QtGui.QColor("#FFD700"))
+        p.drawText(20, host.ticker_height // 2 + 6, "NFL-TCKR — loading scores…")
+        p.end()
+        cards = [img]
+    else:
+        for g in games:
+            try:
+                cards.append(build_game_card(host, g, host.qb_rotate_index))
+            except Exception as e:
+                print(f"[CARD] {g.get('game_id')}: {e}")
+    return _compose_strip_image(cards, host.settings, host.ticker_height, host.dpr)
+
+
+class _SlateThread(QtCore.QThread):
+    """Network fetch only. Painting stays on the UI thread — QPainter on a
+    second thread stalls the scroll clock even when the paint itself is fast.
+    """
+
+    result_ready = QtCore.pyqtSignal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        payload = self._fn()
+        if payload is not None:
+            self.result_ready.emit(payload)
+
+
+class _FontHost:
+    """Font snapshot so cards can be painted on a QThread."""
+
+    _FONT_ATTRS = (
+        "main_font", "score_font", "small_font", "small_font_bold",
+        "small_font_regular", "tiny_font", "vs_font", "time_font",
+        "situation_font", "play_font",
+    )
+
+    def __init__(self, ticker):
+        self.settings = dict(ticker.settings)
+        self.ticker_height = int(ticker.ticker_height)
+        self.dpr = float(ticker.dpr)
+        self.qb_rotate_index = int(ticker.qb_rotate_index)
+        self.qb_faux_bold = bool(getattr(ticker, "qb_faux_bold", False))
+        self._logged_card_align = True
+        for name in self._FONT_ATTRS:
+            src = getattr(ticker, name, None)
+            if src is None:
+                continue
+            font = QtGui.QFont(src)
+            px = font.pixelSize()
+            if px > 0:
+                font.setPixelSize(px)
+            setattr(self, name, font)
+
+
+class _CardBuildThread(QtCore.QThread):
+    """Paint changed cards onto QImages. The scroll blit stays on the UI thread."""
+
+    cards_ready = QtCore.pyqtSignal(object)
+
+    def __init__(self, host, jobs, gen, fp):
+        super().__init__()
+        self._host = host
+        self._jobs = jobs
+        self._gen = gen
+        self._fp = fp
+
+    def run(self):
+        images = {}
+        for key, game in self._jobs:
+            try:
+                img = build_game_card(self._host, game, self._host.qb_rotate_index)
+                if img is not None and not img.isNull():
+                    images[key] = img.copy()
+            except Exception as e:
+                print(f"[CARD] {game.get('game_id')}: {e}")
+            time.sleep(0)
+        self.cards_ready.emit({
+            "gen": self._gen,
+            "fp": self._fp,
+            "images": images,
+        })
+
+
 # ---------------------------------------------------------------------------
 # Ticker window
 # ---------------------------------------------------------------------------
 class NFLTicker(QtWidgets.QWidget):
     games_ready = QtCore.pyqtSignal(list)
     fetch_failed = QtCore.pyqtSignal(str)
+    slate_ready = QtCore.pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -2102,15 +3344,32 @@ class NFLTicker(QtWidgets.QWidget):
         self.games = []
         self.card_images = []
         self.scroll_offset = 0.0  # float for sub-pixel scroll (MLB pattern)
+        self._intro_hold = not _cli_faststart
+        self._scroll_primed = False  # first loop enters from the right
         self.paused = False
         self.qb_rotate_index = 0
         self._fetching = False
-        self._strip = None  # QPixmap with devicePixelRatio set
+        self._worker_busy = False
+        self._worker_pending = False
+        self._pending_fetch = False
+        self._job_gen = 0
+        self._slate_threads = []
+        self._scroll_entries = []  # (QImage, logical width) drawn per frame
+        self._loop_marker = None
+        self._loop_marker_key = None
+        self._card_gap = 0
         self._strip_w = 0.0
+        self._build_gen = 0
+        self._build_fp = None
+        self._build_i = 0
+        self._build_cards = []
+        self._build_cache = {}
         self._scroll_speed_px_per_ms = 0.0
         self._scroll_step_px = 0.0  # fixed px per timer tick (stable dx)
         self._last_frame_ms = 0.0
         self._slate_fp = None  # last composed visual fingerprint
+        self._card_cache = {}
+        self._card_cache_layout = None
         self.cached_background = None
         self._cached_bg_key = None
 
@@ -2172,8 +3431,11 @@ class NFLTicker(QtWidgets.QWidget):
         self._init_fonts()
         self._build_tray()
 
-        self.games_ready.connect(self._on_games)
-        self.fetch_failed.connect(lambda m: print(f"[ESPN] {m}"))
+        self.games_ready.connect(self._on_games, QtCore.Qt.QueuedConnection)
+        self.slate_ready.connect(self._on_slate, QtCore.Qt.QueuedConnection)
+        self.fetch_failed.connect(
+            lambda m: print(f"[ESPN] {m}"), QtCore.Qt.QueuedConnection
+        )
 
         # Animation clock: prefer DwmFlush VBlank (MLB). QTimer is fallback only —
         # residual "little judder" with fixed dx was phase drift vs the display.
@@ -2233,32 +3495,64 @@ class NFLTicker(QtWidgets.QWidget):
         self.qb_timer.timeout.connect(self._rotate_qb)
         self.qb_timer.start(QB_ROTATE_MS)
 
+        if self._intro_hold:
+            self._intro_timer = QtCore.QTimer(self)
+            self._intro_timer.setSingleShot(True)
+            self._intro_timer.timeout.connect(self._end_intro)
+            self._intro_timer.start(INTRO_HOLD_MS)
+            print(f"[NFL-TCKR] title hold {INTRO_HOLD_MS}ms (skip with --faststart)")
+        else:
+            print("[NFL-TCKR] --faststart: skipping title hold")
+
         self.refresh_games()
 
     def _init_fonts(self):
-        family = load_ticker_font()
-        pref = self.settings.get("font", "Ozone")
-        if pref and pref != "Ozone":
-            family = pref
         scale = self.settings.get("font_scale_percent", 160) / 100.0
         # MLB-TCKR formula for pitcher/batter / player-info text
         pscale = self.settings.get("player_font_scale_percent", 75) / 100.0
-        requested_player = self.settings.get("player_info_font", "Gotham Black")
-        player_family = (
-            requested_player
-            if requested_player in QtGui.QFontDatabase().families()
-            else load_player_font_family(family)
-        )
+        ticker_request = self.settings.get("font", "Ozone") or "Ozone"
+        player_request = self.settings.get("player_info_font", "Gotham Black") or "Gotham Black"
+        family = resolve_font_family(ticker_request, "Arial Black")
+        player_family = resolve_font_family(player_request, family)
+        ticker_source = font_resolve_source(ticker_request, "Arial Black")
+        player_source = font_resolve_source(player_request, family)
         h = self.ticker_height
 
         self.main_font = QtGui.QFont(family)
         self.main_font.setPixelSize(max(12, int(h * 0.38 * scale)))
         self.main_font.setBold(True)
 
-        # QB / player stats — same face + size math as MLB-TCKR small_font
-        self.small_font = QtGui.QFont(player_family)
+        # Scores sit beside the names; a bit larger than the team-name face.
+        self.score_font = QtGui.QFont(family)
+        self.score_font.setPixelSize(max(14, int(h * 0.45 * scale)))
+        self.score_font.setBold(True)
+
+        # QB / player stats — the selected player-info face, not a substituted sans.
+        # Labels are the same face, 1px smaller.
         base_small_px = max(6, int(h * 0.22 * scale * 0.5)) + 3
-        self.small_font.setPixelSize(max(6, int(base_small_px * pscale)))
+        small_px = max(6, int(base_small_px * pscale))
+        label_px = max(5, small_px - 1)
+        self.small_font = QtGui.QFont(player_family)
+        self.small_font.setPixelSize(small_px)
+        self.small_font_bold = QtGui.QFont(self.small_font)
+        self.small_font_regular = QtGui.QFont(self.small_font)
+        self.small_font_regular.setPixelSize(label_px)
+        self.qb_faux_bold = False
+
+        # Down uses the player-info face; last play uses fonts/zed-sans-regular.ttf.
+        # Unscaled by font_scale_percent so clock + down + two play lines fit the bar.
+        situation_px = max(10, int(h * 0.20))
+        play_px = max(6, int(h * 0.145) - 2)
+        if play_px >= situation_px:
+            play_px = max(6, situation_px - 2)
+        self.situation_font = QtGui.QFont(player_family)
+        self.situation_font.setPixelSize(situation_px)
+        play_family, play_source = _load_bundled_font_file("zed-sans-regular.ttf")
+        if not play_family:
+            play_family = resolve_font_family("Zed Sans", player_family)
+            play_source = font_resolve_source("Zed Sans", player_family)
+        self.play_font = QtGui.QFont(play_family)
+        self.play_font.setPixelSize(play_px)
 
         self.tiny_font = QtGui.QFont(family)
         self.tiny_font.setPixelSize(max(7, int(h * 0.15 * scale * pscale)))
@@ -2269,8 +3563,36 @@ class NFLTicker(QtWidgets.QWidget):
 
         # Kickoff / quarter-clock — visibly smaller than vs_font / prior center text
         self.time_font = QtGui.QFont(family)
-        self.time_font.setPixelSize(max(6, int(h * 0.16 * scale)))
+        self.time_font.setPixelSize(max(6, int(h * 0.16 * scale)) + 1)
         self.time_font.setBold(True)
+
+        _dbg(f"font ticker request '{ticker_request}' -> {family} ({ticker_source})")
+        _dbg(
+            f"font player info request '{player_request}' -> "
+            f"{player_family} ({player_source})"
+        )
+        _dbg(
+            f"font last play request 'zed-sans-regular.ttf' -> "
+            f"{play_family} ({play_source})"
+        )
+        for label, font in (
+            ("team names", self.main_font),
+            ("scores", self.score_font),
+            ("clock / kickoff / break heading", self.time_font),
+            ("pregame vs / final mark", self.vs_font),
+            ("qb name and numbers", self.small_font_bold),
+            ("qb labels (YDS TD INT)", self.small_font_regular),
+            ("down and distance", self.situation_font),
+            ("last play", self.play_font),
+            ("center sub line", self.small_font),
+            ("version watermark", self.tiny_font),
+        ):
+            _dbg(f"font {label}: {_font_debug_desc(font)}")
+        _dbg(
+            f"font quarter table: {_font_debug_desc(self.situation_font)} "
+            f"(sized down to fit the bar)"
+        )
+        _dbg(f"font scoring alert: {family} (ticker face, sized to the bar)")
 
     def _build_tray(self):
         icon_path = FOOTBALL_ICON_PATH
@@ -2286,6 +3608,8 @@ class NFLTicker(QtWidgets.QWidget):
         menu.addSeparator()
         menu.addAction("Pause / Resume", self.toggle_pause)
         menu.addSeparator()
+        menu.addAction("About…", self.show_about)
+        menu.addSeparator()
         menu.addAction("Quit", QtWidgets.QApplication.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
@@ -2300,8 +3624,36 @@ class NFLTicker(QtWidgets.QWidget):
         menu.addAction("Refresh", self.refresh_games)
         menu.addAction("Pause / Resume", self.toggle_pause)
         menu.addSeparator()
+        menu.addAction("About…", self.show_about)
+        menu.addSeparator()
         menu.addAction("Quit", QtWidgets.QApplication.quit)
         menu.exec_(global_pos)
+
+    def show_about(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("About NFL-TCKR")
+        dlg.setModal(True)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        title = QtWidgets.QLabel(f"NFL-TCKR {VERSION}")
+        font = title.font()
+        font.setBold(True)
+        font.setPointSize(max(11, font.pointSize() + 2))
+        title.setFont(font)
+        body = QtWidgets.QLabel(
+            "Author: Paul R. Charovkine [krypdoh]<br>"
+            "Copyright: 2026 All Rights Reserved<br>"
+            'Website: <a href="https://github.com/krypdoh/NFL-TCKR">'
+            "github.com/krypdoh/NFL-TCKR</a>"
+        )
+        body.setTextFormat(QtCore.Qt.RichText)
+        body.setOpenExternalLinks(True)
+        body.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+        layout.addWidget(title)
+        layout.addWidget(body)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec_()
 
     def open_settings(self):
         dlg = SettingsDialog(self.settings, self)
@@ -2326,35 +3678,236 @@ class NFLTicker(QtWidgets.QWidget):
             self.cached_background = None
             self._cached_bg_key = None
             self._slate_fp = None  # force strip rebuild after settings (colors/fonts/etc.)
-            self._rebuild_cards()
             self.refresh_games()
 
     def toggle_pause(self):
         self.paused = not self.paused
 
     def refresh_games(self):
-        if self._fetching:
+        self._request_slate(True)
+
+    def _request_slate(self, fetch):
+        """Fetch off the UI thread. Card pixels are built on the UI thread."""
+        if not fetch:
+            self._publish_strip()
             return
-        self._fetching = True
+        self._job_gen += 1
+        self._pending_fetch = True
+        if self._worker_busy:
+            self._worker_pending = True
+            return
+        self._start_slate_worker(self._job_gen)
+
+    def _start_slate_worker(self, gen):
+        self._worker_busy = True
+        self._worker_pending = False
+        self._pending_fetch = False
         settings = dict(self.settings)
 
         def worker():
+            payload = {
+                "gen": gen,
+                "fetch": True,
+                "error": None,
+                "games": None,
+            }
             try:
-                games = fetch_nfl_games(settings)
-                self.games_ready.emit(games)
+                payload["games"] = fetch_nfl_games(settings)
             except Exception as e:
-                self.fetch_failed.emit(str(e))
-            finally:
-                self._fetching = False
+                payload["error"] = str(e)
+            return payload
 
-        threading.Thread(target=worker, daemon=True).start()
+        thread = _SlateThread(worker)
+        self._slate_threads.append(thread)
+        thread.result_ready.connect(self._on_slate, QtCore.Qt.QueuedConnection)
+        thread.finished.connect(lambda t=thread: self._drop_slate_thread(t))
+        thread.start()
+
+    def _drop_slate_thread(self, thread):
+        try:
+            self._slate_threads.remove(thread)
+        except ValueError:
+            pass
+        thread.deleteLater()
+
+    def _on_slate(self, payload):
+        """Swap in a strip that was already painted. Scroll keeps using the old one until then."""
+        stale = payload.get("gen") != self._job_gen
+        self._worker_busy = False
+        if payload.get("error"):
+            print(f"[ESPN] {payload.get('error')}")
+        if not stale and not payload.get("error"):
+            games = payload.get("games") or []
+            self._detect_scoring_alerts(games)
+            self.games = games
+            self._publish_strip()
+            if payload.get("fetch"):
+                self._apply_poll_interval(games)
+                print(f"[NFL-TCKR] {len(self.games)} game(s) loaded")
+        if self._worker_pending or stale:
+            self._worker_pending = False
+            self._start_slate_worker(self._job_gen)
+
+    def _publish_strip(self):
+        """Queue card paints between frames. The cards on screen keep scrolling."""
+        layout = _layout_tuple(self.settings, self.ticker_height, self.dpr)
+        if layout != self._card_cache_layout:
+            self._card_cache = {}
+            self._card_cache_layout = layout
+        fp = _slate_fp(
+            self.settings, self.games, self.qb_rotate_index,
+            self.ticker_height, self.dpr,
+        )
+        if fp == self._slate_fp and self._scroll_entries:
+            return
+        if fp == self._build_fp:
+            return
+        self._build_gen += 1
+        gen = self._build_gen
+        self._build_fp = fp
+        games = list(self.games or [])
+        if not games:
+            image, _period = _render_strip(self, [])
+            cards = [image] if image is not None and not image.isNull() else []
+            self._install_scroll_cards(cards, {}, fp)
+            return
+        order = []
+        misses = []
+        cache = {}
+        for g in games:
+            key = _game_visual_key(g, self.qb_rotate_index, self.settings)
+            order.append(key)
+            img = self._card_cache.get(key)
+            if img is None:
+                misses.append((key, g))
+            else:
+                cache[key] = img
+        self._build_order = order
+        self._build_cache = cache
+        if not misses:
+            self._install_scroll_cards(
+                [cache[k] for k in order if k in cache], cache, fp,
+            )
+            return
+        if not self._scroll_entries and not self._intro_hold:
+            self._show_loading_card()
+        host = _FontHost(self)
+        thread = _CardBuildThread(host, misses, gen, fp)
+        self._slate_threads.append(thread)
+        thread.cards_ready.connect(self._on_cards_built, QtCore.Qt.QueuedConnection)
+        thread.finished.connect(lambda t=thread: self._drop_slate_thread(t))
+        thread.start()
+
+    def _loop_marker_entry(self):
+        """NFL shield card that leads the loop. Cached until height or DPR changes."""
+        key = (int(self.ticker_height), round(float(self.dpr), 3))
+        if self._loop_marker is not None and self._loop_marker_key == key:
+            return self._loop_marker
+        img = build_loop_marker_card(self)
+        dpr = float(img.devicePixelRatio()) or float(self.dpr) or 1.0
+        width = max(1, int(round(img.width() / dpr)))
+        self._loop_marker = (img, width)
+        self._loop_marker_key = key
+        return self._loop_marker
+
+    def _show_loading_card(self):
+        """One cheap card so the bar can scroll while the real cards are painted."""
+        image, _period = _render_strip(self, [])
+        if image is None or image.isNull():
+            return
+        dpr = float(image.devicePixelRatio()) or float(self.dpr) or 1.0
+        width = max(1, int(round(image.width() / dpr)))
+        gap = self._card_gap or max(29, int(round(self.ticker_height * 1.80)))
+        self._card_gap = gap
+        entries = [self._loop_marker_entry(), (image, width)]
+        self._scroll_entries = entries
+        self._strip_w = float(sum(w for _img, w in entries) + len(entries) * gap)
+        if not self._intro_hold and not self._scroll_primed:
+            self._prime_scroll_from_right()
+        self.update()
+
+    def _on_cards_built(self, payload):
+        if payload.get("gen") != self._build_gen:
+            return
+        images = payload.get("images") or {}
+        cache = dict(self._build_cache)
+        cache.update(images)
+        cards = [cache[k] for k in self._build_order if cache.get(k) is not None]
+        self._install_scroll_cards(cards, cache, payload.get("fp"))
+
+    def _install_scroll_cards(self, cards, cache, fp):
+        h = int(self.ticker_height)
+        dpr = float(self.dpr)
+        space_pct = max(0, min(200, int(self.settings.get("game_spacing_percent", 100))))
+        gap = max(29, int(round(h * 1.80 * (space_pct / 100.0))))
+        entries = [self._loop_marker_entry()]
+        for img in cards:
+            if img is None or img.isNull():
+                continue
+            idpr = float(img.devicePixelRatio()) or dpr
+            entries.append((img, max(1, int(round(img.width() / idpr)))))
+        if not entries:
+            self._build_fp = None
+            return
+        period = float(sum(w for _img, w in entries) + len(entries) * gap)
+        old_period = self._strip_w
+        self._card_cache = cache
+        self._scroll_entries = entries
+        self._card_gap = gap
+        self._strip_w = period
+        if not self._intro_hold:
+            if not self._scroll_primed:
+                self._prime_scroll_from_right()
+            elif period > 0 and self.scroll_offset >= 0:
+                if old_period > 0 and abs(old_period - period) > 0.5:
+                    self.scroll_offset = self.scroll_offset % period
+                elif self.scroll_offset >= period:
+                    self.scroll_offset = self.scroll_offset % period
+        self._slate_fp = fp
+        self._build_fp = None
+        self.update()
+
+    def _prime_scroll_from_right(self):
+        """Place the first card just off the right edge so the loop walks in."""
+        if self._scroll_primed or self._intro_hold:
+            return
+        if not self._scroll_entries or self._strip_w <= 0:
+            return
+        self.scroll_offset = -float(max(1, self.width()))
+        self._scroll_primed = True
+
+    def _end_intro(self):
+        self._intro_hold = False
+        self._prime_scroll_from_right()
+        self.update()
+
+    def _draw_intro_title(self, painter, w, h):
+        text = "NFL-TCKR"
+        font = QtGui.QFont(self.main_font)
+        font.setPixelSize(max(16, int(h * 0.55)))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#FFD700"))
+        fm = QtGui.QFontMetrics(font)
+        tw = fm.horizontalAdvance(text)
+        cap = fm.capHeight()
+        if cap <= 0:
+            cap = fm.ascent()
+        x = (w - tw) // 2
+        y = int(round(h / 2.0 + cap / 2.0))
+        painter.drawText(x, y, text)
+
+    def _apply_poll_interval(self, games):
+        ms = _poll_interval_ms(self.settings, games)
+        self.update_timer.setInterval(ms)
+        self.update_timer.start()
 
     def _on_games(self, games):
         new_games = games or []
         self._detect_scoring_alerts(new_games)
         self.games = new_games
         print(f"[NFL-TCKR] {len(self.games)} game(s) loaded")
-        self._rebuild_cards()
+        self._request_slate(False)
 
     def _detect_scoring_alerts(self, games):
         """Queue MLB-style flashes for newly seen ESPN scoringPlays (deduped by id)."""
@@ -2527,7 +4080,7 @@ class NFLTicker(QtWidgets.QWidget):
     def _rotate_qb(self):
         self.qb_rotate_index += 1
         if self.games:
-            self._rebuild_cards()
+            self._request_slate(False)
 
     def _update_scroll_speed(self):
         """Logical px/ms + fixed px per display refresh (VBlank or timer tick)."""
@@ -2588,124 +4141,14 @@ class NFLTicker(QtWidgets.QWidget):
         return super().event(event)
 
     def _slate_fingerprint(self):
-        """Visual identity of the current slate — skip strip rebuild when equal."""
-        s = self.settings
-        layout = (
-            int(s.get("ticker_height", 72)),
-            int(s.get("game_spacing_percent", 100)),
-            int(s.get("font_scale_percent", 160)),
-            int(s.get("player_font_scale_percent", 75)),
-            s.get("font", "Ozone"),
-            s.get("player_info_font", "Gotham Black"),
-            bool(s.get("show_qb_stats", True)),
-            bool(s.get("show_last_play", True)),
-            bool(s.get("show_ball_on", True)),
-            bool(s.get("show_possession", True)),
-            bool(s.get("glow_team_names", False)),
-            bool(s.get("glow_all", False)),
-            bool(s.get("use_city_abbreviations", False)),
-            bool(s.get("show_city_only", False)),
-            bool(s.get("show_team_cities", False)),
-            round(float(self.dpr), 3),
+        return _slate_fp(
+            self.settings, self.games, self.qb_rotate_index,
+            self.ticker_height, self.dpr,
         )
-        if not self.games:
-            return ("empty", layout)
-        games_fp = tuple(
-            _game_visual_key(g, self.qb_rotate_index, s) for g in self.games
-        )
-        return (games_fp, layout)
 
     def _rebuild_cards(self):
-        fp = self._slate_fingerprint()
-        if fp == self._slate_fp and self._strip is not None:
-            if _NFL_SCROLL_DEBUG:
-                _scroll_dbg(
-                    f"STRIP skip (slate unchanged) cards={len(self.games)} "
-                    f"period={self._strip_w:.0f}px"
-                )
-            return
-        self.card_images = []
-        if not self.games:
-            # Placeholder card
-            img = QtGui.QImage(
-                int(320 * self.dpr), int(self.ticker_height * self.dpr),
-                QtGui.QImage.Format_ARGB32_Premultiplied,
-            )
-            img.setDevicePixelRatio(self.dpr)
-            img.fill(0)
-            p = QtGui.QPainter(img)
-            p.setFont(self.main_font)
-            p.setPen(QtGui.QColor("#FFD700"))
-            p.drawText(20, self.ticker_height // 2 + 6, "NFL-TCKR — loading scores…")
-            p.end()
-            self.card_images = [img]
-        else:
-            for g in self.games:
-                try:
-                    self.card_images.append(
-                        build_game_card(self, g, self.qb_rotate_index)
-                    )
-                except Exception as e:
-                    print(f"[CARD] {g.get('game_id')}: {e}")
-        old_period = self._strip_w
-        self._compose_strip()
-        # Keep fractional position across rebuilds; wrap if period changed
-        if self._strip_w > 0:
-            if old_period > 0 and abs(old_period - self._strip_w) > 0.5:
-                self.scroll_offset = self.scroll_offset % self._strip_w
-            elif self.scroll_offset >= self._strip_w:
-                self.scroll_offset = self.scroll_offset % self._strip_w
-        self._slate_fp = fp
-        self.update()
-
-    def _compose_strip(self):
-        """Precompose a doubled DPR-aware strip pixmap (MLB: blit, don't rescale each frame)."""
-        t0 = time.perf_counter() if _NFL_SCROLL_DEBUG else 0.0
-        if not self.card_images:
-            self._strip = None
-            self._strip_w = 0.0
-            if _NFL_SCROLL_DEBUG:
-                _scroll_dbg("STRIP cleared (no cards)")
-            return
-        h = self.ticker_height
-        dpr = self.dpr
-        # Fixed inter-card gap (MLB-TCKR: ~3× ticker height at 100% spacing).
-        # Applied here — not baked into card images — so pre/live/final cards
-        # share the same visual separation regardless of content width.
-        space_pct = max(0, min(200, int(self.settings.get("game_spacing_percent", 100))))
-        space_scale = space_pct / 100.0
-        inter_gap = max(48, int(round(h * 3.00 * space_scale)))
-
-        widths = []
-        for img in self.card_images:
-            idpr = float(img.devicePixelRatio()) or dpr
-            widths.append(max(1, int(round(img.width() / idpr))))
-        n = len(widths)
-        # Gap after every card (including last → first in the seamless loop)
-        period = sum(widths) + n * inter_gap
-        strip = QtGui.QPixmap(
-            max(1, int(period * 2 * dpr)),
-            max(1, int(h * dpr)),
-        )
-        strip.setDevicePixelRatio(dpr)
-        strip.fill(QtCore.Qt.transparent)
-        p = QtGui.QPainter(strip)
-        x = 0.0
-        for _ in range(2):
-            for img, w in zip(self.card_images, widths):
-                # Logical dest; source may be physical QImage — Qt scales once at compose time
-                p.drawImage(QtCore.QRectF(x, 0, w, h), img)
-                x += w + inter_gap
-        p.end()
-        self._strip = strip
-        self._strip_w = float(period)
-        if _NFL_SCROLL_DEBUG:
-            ms = (time.perf_counter() - t0) * 1000.0
-            _scroll_dbg(
-                f"STRIP rebuild cards={n} period={period:.0f}px "
-                f"pix={strip.width()}x{strip.height()} dpr={dpr:.2f} "
-                f"{ms:.1f}ms (hitch risk)"
-            )
+        """Schedule a strip render off the UI thread."""
+        self._request_slate(False)
 
     def _scroll_dbg_note_tick(self, tick_dt_ms, dx_px, paused, reason=""):
         """Accumulate timer-tick samples; emit SPIKE + ~1s summary."""
@@ -2821,12 +4264,22 @@ class NFLTicker(QtWidgets.QWidget):
         """Advance one frame. VBlank: fixed px/refresh + sync repaint (no catch-up)."""
         now_ms = self._elapsed.nsecsElapsed() / 1_000_000.0
         tick_dt = (now_ms - self._last_frame_ms) if self._last_frame_ms > 0 else None
+        if self._intro_hold:
+            self._last_frame_ms = now_ms
+            self._scroll_dbg_note_tick(tick_dt, 0.0, paused=True, reason="intro")
+            if _vsync:
+                self.repaint()
+            else:
+                self.update()
+            return
+        if not self._scroll_primed:
+            self._prime_scroll_from_right()
         if self._current_alert is not None:
             # Freeze scroll while scoring flash plays; don't accumulate catch-up
             self._last_frame_ms = now_ms
             self._scroll_dbg_note_tick(tick_dt, 0.0, paused=True, reason="alert")
             return
-        if self.paused or not self._strip or self._strip_w <= 0:
+        if self.paused or not self._scroll_entries or self._strip_w <= 0:
             self._last_frame_ms = now_ms
             reason = "hover/space" if self.paused else "no-strip"
             self._scroll_dbg_note_tick(tick_dt, 0.0, paused=True, reason=reason)
@@ -2881,7 +4334,7 @@ class NFLTicker(QtWidgets.QWidget):
         # Cached LED / solid background (avoid per-frame line loops)
         opacity = int(self.settings.get("background_opacity", 230))
         led = bool(self.settings.get("led_background", True))
-        bg_key = (led, opacity, w, h)
+        bg_key = (led, opacity, w, h, VERSION)
         if self._cached_bg_key != bg_key or self.cached_background is None:
             self.cached_background = QtGui.QPixmap(w, h)
             self.cached_background.fill(QtCore.Qt.transparent)
@@ -2891,26 +4344,44 @@ class NFLTicker(QtWidgets.QWidget):
                 bg.setPen(QtGui.QColor(20, 40, 20, 80))
                 for y in range(0, h, 3):
                     bg.drawLine(0, y, w, y)
+            bg.setPen(QtGui.QColor(80, 80, 80, 120))
+            bg.setFont(self.tiny_font)
+            bg.drawText(6, h - 4, f"NFL-TCKR {VERSION}")
             bg.end()
             self._cached_bg_key = bg_key
         painter.drawPixmap(0, 0, self.cached_background)
 
+        if self._intro_hold:
+            self._draw_intro_title(painter, w, h)
+            painter.end()
+            if _NFL_SCROLL_DEBUG:
+                cost = (time.perf_counter() - _paint_t0) * 1000.0
+                self._scroll_dbg_note_paint(paint_dt, cost)
+            return
+
         # Scroll content (scores/logos/names) — content_opacity like MLB-TCKR
-        if self._strip is not None and self._strip_w > 0:
+        if self._scroll_entries and self._strip_w > 0:
             content_alpha = max(0, min(255, int(self.settings.get("content_opacity", 255)))) / 255.0
             painter.setOpacity(content_alpha)
             _smooth = self.dpr < 2.0
             if _smooth:
                 painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-            painter.drawPixmap(QtCore.QPointF(-self.scroll_offset, 0), self._strip)
+            offset = self.scroll_offset
+            period = self._strip_w
+            gap = self._card_gap
+            view_w = w
+            for lap in (0.0, period):
+                x = lap - offset
+                for img, cw in self._scroll_entries:
+                    if x + cw > 0 and x < view_w:
+                        painter.drawImage(QtCore.QRectF(x, 0, cw, h), img)
+                    x += cw + gap
+                    if x >= view_w:
+                        break
             if _smooth:
                 painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
             painter.setOpacity(1.0)
 
-        # Version watermark (tiny)
-        painter.setPen(QtGui.QColor(80, 80, 80, 120))
-        painter.setFont(self.tiny_font)
-        painter.drawText(6, h - 4, f"NFL-TCKR {VERSION}")
         painter.end()
         if _NFL_SCROLL_DEBUG:
             cost = (time.perf_counter() - _paint_t0) * 1000.0
@@ -2965,6 +4436,8 @@ class NFLTicker(QtWidgets.QWidget):
                 self._vblank_driver.wait(500)
         except Exception:
             pass
+        for thread in list(getattr(self, "_slate_threads", [])):
+            thread.wait(200)
         if hasattr(self, "scroll_timer") and self.scroll_timer.isActive():
             self.scroll_timer.stop()
         if hasattr(self, "_fullscreen_timer"):
@@ -3614,10 +5087,17 @@ def main():
             "(or NFL_TCKR_SCROLL_DEBUG=1)",
             flush=True,
         )
+    if _cli_faststart:
+        print("[NFL-TCKR] --faststart: skip title hold", flush=True)
     print(f"[NFL-TCKR] logos: {LOGO_DIR}", flush=True)
     print(
         f"[NFL-TCKR] football icon: {FOOTBALL_ICON_PATH} "
         f"({'ok' if os.path.isfile(FOOTBALL_ICON_PATH) else 'MISSING'})",
+        flush=True,
+    )
+    print(
+        f"[NFL-TCKR] loop logo: {NFL_COM_LOGO_PATH} "
+        f"({'ok' if os.path.isfile(NFL_COM_LOGO_PATH) else 'MISSING'})",
         flush=True,
     )
     ticker = NFLTicker()
