@@ -1,0 +1,41 @@
+# Logs
+*.log
+debug.log
+
+# PyInstaller / build output
+build/
+dist/
+*.exe
+*.pkg
+*.pyd
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+.env
+
+# Signing certs (do not upload)
+*.pfx
+*.p12
+*.pem
+
+# Editor / OS junk
+.cursor/
+.kilo/
+.vscode/
+.idea/
+.hintrc
+Thumbs.db
+Desktop.ini
+.DS_Store
+*~
+*.tmp
+*.bak
+*.orig
