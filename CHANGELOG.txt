@@ -1,0 +1,151 @@
+NFL-TCKR CHANGELOG
+==================
+
+0.1.23 — 2026-09-27
+-------------------
+- Logo / possession-icon white glow much more subtle: lower opacity (~half),
+  tighter scale, smaller pad; team-name / text bloom unchanged from 0.1.22
+
+0.1.22 — 2026-09-27
+-------------------
+- Team-name / text glow: real behind-glyph bloom (wide soft silhouette + heavy
+  multi-pass blur at moderate opacity) so names keep normal weight instead of
+  looking bold/outlined; shared _draw_text_glow also improves glow_all text
+
+0.1.21 — 2026-09-27
+-------------------
+- AppBar fix: always ABM_NEW/QUERYPOS/SETPOS when docked (old “passive dock”
+  skipped shell registration whenever anything was already at the top, so the
+  bar never reserved desktop space)
+- Force SPI_SETWORKAREA if the shell does not shrink the work area after SETPOS
+- Deferred + retry AppBar setup after HWND is realized; clearer [AppBar] logs
+
+0.1.20 — 2026-09-27
+-------------------
+- Glow reworked as soft background bloom (blurred halo behind content) instead of
+  tight offset copies that only made glyphs look bolder
+
+0.1.19 — 2026-09-27
+-------------------
+- Windows AppBar: docked mode reserves top desktop strip (SHAppBarMessage)
+- Passive dock below sister tickers (MLB-TCKR / other *-TCKR) so bars don’t stack
+- Fullscreen yield: hide via opacity when a fullscreen app owns the monitor
+- Settings: “Docked (reserve desktop space)” checkbox (default on); undocked =
+  floating always-on-top without AppBar
+
+0.1.18 — 2026-09-27
+-------------------
+- Settings: optional "Glow team names" (team-color halo)
+- Settings: optional "Glow all items" (text glow + faint white logo glow)
+
+0.1.17 — 2026-09-27
+-------------------
+- Settings: Content transparency slider (scores/logos/names/stats strip)
+- Renamed prior control to Background transparency for clarity
+
+0.1.16 — 2026-09-27
+-------------------
+- Settings → General: Transparency slider (0% solid … 100% clear) for ticker
+  background; persists as background_opacity
+
+0.1.15 — 2026-09-27
+-------------------
+- Scroll debug default OFF; enable with `python NFL-TCKR.py --debug`
+  (or NFL_TCKR_SCROLL_DEBUG=1; =0 forces off)
+
+0.1.14 — 2026-09-27
+-------------------
+- Residual scroll judder: drive animation from DwmFlush VBlank (MLB _VBlankDriver),
+  not QTimer — fixed dx still phase-drifted vs the display refresh
+- Each VBlank: fixed px/refresh + synchronous repaint() before compositor deadline
+- QTimer remains fallback if DwmFlush unavailable; SCROLL_DEBUG shows clock=VBlank|QTimer
+
+0.1.13 — 2026-09-27
+-------------------
+- Scroll judder: fixed px/tick at ~display refresh (no wall-clock dt catch-up)
+  — kills dx swing from 8 ms timer jitter (logs: spikes=0 but dx 0.2–5.3 px)
+- Skip STRIP rebuild when slate fingerprint unchanged (scoreboard poll + QB rotate)
+  — stops ~5 s / refresh 32k pixmap hitches when cards look identical
+- Preserve scroll offset across rebuilds; SPIKE threshold 1.5× for softer cadence hits
+- SCROLL_DEBUG summaries include fixed step=…px
+
+0.1.12 — 2026-09-27
+-------------------
+- Fix name Y: center on *actual* KeepAspectRatio logo height (was using request box
+  79px while logos draw at ~59px → names sat low beside logos)
+- Extra optical lift (~logo_h/8); one-shot [CARD] align coordinate log
+- Scroll debug default ON (SCROLL_DEBUG=True); NFL_TCKR_SCROLL_DEBUG=0 to silence
+- All [SCROLL]/DEBUG] prints flush=True; loud startup "[SCROLL] profiler enabled"
+
+0.1.11 — 2026-09-27
+-------------------
+- Card layout: team names optically centered on logos (QB stats still under name)
+- Was centering name+QB as one block, which sat names too low beside the logo
+  (incomplete: still used logo_size box, not pixmap height — fixed in 0.1.12)
+
+0.1.10 — 2026-09-27
+-------------------
+- Scroll judder profiler: NFL_TCKR_SCROLL_DEBUG=1 (dedicated; API DEBUG can stay off)
+- ~1s summaries: tick/paint dt min/avg/max/jitter/stdev, dx, offset, pause state
+- Immediate SPIKE lines when tick dt > 2× timer target or paint interval > 2× VBlank
+- Logs STRIP rebuilds (pixmap recompose hitch risk)
+
+0.1.9 — 2026-09-27
+------------------
+- Smooth scroll: PreciseTimer ≤8 ms + delta-time px/ms (MLB QTimer path; kills ~1 Hz judder beat)
+- Strip is a DPR-aware QPixmap; paint blits via QPointF (no per-frame rescale)
+- SmoothPixmapTransform only at DPR<2; LED background cached
+
+0.1.8 — 2026-09-27
+------------------
+- Settings: Team Colors tab (AFC/NFC divisions) with Primary/Secondary/Tertiary/Custom
+- Defaults seeded from NFL team color guide hexes; overrides persist in Settings.json
+- get_team_color matches MLB model (per-team slot int or custom hex → names + flash)
+
+0.1.7 — 2026-09-27
+------------------
+- Consistent inter-card gap: fixed ~3× ticker height (MLB-style) in strip composer
+- No longer embeds tiny trailing spacing in each card (avoids pregame bunching)
+
+0.1.6 — 2026-09-27
+------------------
+- Player surnames keep multi-part / suffixes (Beckham Jr., Penix Jr., Cook III)
+- Prefer ESPN athlete lastName; unified format_player_lastname for QB + scoring flash
+
+0.1.5 — 2026-09-27
+------------------
+- Pregame: hide 0-0 score digits (kickoff/vs only until live/final)
+- Scoring flash: team-color sweep overlay on new ESPN scoringPlays (live only)
+- Alert text: PASS / RUN / FIELD GOAL / SAFETY / 2PT / XP; dedupe by play id
+- DEBUG notes when a scoring flash is queued/shown
+
+0.1.4 — 2026-09-27
+------------------
+- Finals: hide last-play text under the score (show "F" only)
+
+0.1.3 — 2026-09-27
+------------------
+- DEBUG console logs for ESPN GETs (endpoint, status, ms) + abbreviated payloads
+- Parsed-game digests include scores, situation, QB lines (game vs season scope)
+- Gate with NFL_TCKR_DEBUG (default ON; set 0/false/off to silence)
+
+0.1.2 — 2026-09-27
+------------------
+- QB stats: live + final use this game's boxscore passing; pregame uses season leaders
+- Pregame season lines formatted as C/ATT YDS TD Int (from competitor passingLeader)
+
+0.1.1 — 2026-09-27
+------------------
+- Logos 2× size on score cards
+- Smaller kickoff / clock time font
+- QB/player stats use Gotham Black (+ MLB-TCKR size formula), matching MLB player text
+
+0.1.0 — 2026-09-27
+------------------
+- Initial NFL ticker (sibling to MLB-TCKR)
+- ESPN scoreboard + summary fetch for scores, situation, QB boxscore
+- Layout: logos, team-colored names, center score / down & distance
+- Last play under score (wraps to 2 lines), ball-on text, possession football icon
+- QB stats under team names; rotate when ≥2 QBs with ≥4 pass attempts
+- Settings: name display (team / city / both / abbr), refresh, height, filters
+- System tray + hover-to-pause scrolling bar
