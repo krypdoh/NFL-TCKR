@@ -7,11 +7,12 @@ Copyright: 2026 Paul R. Charovkine
 Description:
 NFL ticker application that displays live football game data in a scrolling
 ticker bar — logos, colored names, scores, down & distance, last play, QB
-stats, ball-on, and possession. Data via ESPN public site API. Integrates with
-Windows AppBar for docked desktop reservation (same model as MLB-TCKR).
+stats, ball-on, possession, and optional post-game leaders. Data via ESPN
+public site API. Integrates with Windows AppBar for docked desktop reservation
+(same model as MLB-TCKR).
 """
 
-VERSION = "0.1.24"
+VERSION = "0.1.47"
 
 import ctypes
 from ctypes import wintypes
@@ -141,9 +142,12 @@ ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summa
 QB_ROTATE_MS = 5000
 QB_MIN_ATTEMPTS = 4  # proxy for "snaps" — ESPN boxscore has no snap count here
 INTRO_HOLD_MS = 3000  # centered yellow title before the first scroll
-SCORE_ALERT_HOLD_MS = 6000  # hold phase duration for scoring flash
+SCORE_ALERT_HEADLINE_MS = 3000  # hold: all-caps type line
+SCORE_ALERT_DETAIL_MS = 4000  # hold: play detail line
+SCORE_ALERT_HOLD_MS = SCORE_ALERT_HEADLINE_MS + SCORE_ALERT_DETAIL_MS  # 7000
 SCORE_ALERT_IN_MS = 600
 SCORE_ALERT_OUT_MS = 400
+TEST_ADVANCE_MS = 4500  # fake live slate clock / play tick (-test only)
 REQUEST_TIMEOUT = 20
 USER_AGENT = "NFL-TCKR/0.1 (+https://github.com/krypdoh/MLB-TCKR)"
 
@@ -158,7 +162,11 @@ _NFL_DEBUG = os.environ.get("NFL_TCKR_DEBUG", "1").strip().lower() not in (
 SCROLL_DEBUG = False
 _cli_debug = "--debug" in sys.argv
 _cli_faststart = "--faststart" in sys.argv
-sys.argv = [a for a in sys.argv if a not in ("--debug", "--faststart")]
+_cli_test = "-test" in sys.argv or "--test" in sys.argv
+sys.argv = [
+    a for a in sys.argv
+    if a not in ("--debug", "--faststart", "-test", "--test")
+]
 _env_scroll = os.environ.get("NFL_TCKR_SCROLL_DEBUG", "").strip().lower()
 if _env_scroll in ("0", "false", "no", "off"):
     _NFL_SCROLL_DEBUG = False
@@ -308,6 +316,11 @@ def _ensure_appdata():
         os.makedirs(APPDATA_DIR, exist_ok=True)
 
 
+_GENERIC_TICKER_FONTS = frozenset({
+    "arial", "arial black", "segoe ui", "tahoma", "calibri", "verdana",
+    "ms shell dlg", "ms shell dlg 2", "sans-serif", "sans serif",
+})
+
 def get_settings():
     global _SETTINGS_CACHE
     with _SETTINGS_LOCK:
@@ -326,9 +339,12 @@ def get_settings():
         "show_city_only": False,
         "use_city_abbreviations": False,
         "include_final_games": True,
+        "include_postgame_stats": False,
+        "postgame_font": "Gotham Black",
         "include_scheduled_games": True,
         "live_games_only": False,
         "show_last_play": True,
+        "show_drive_summary": False,
         "show_qb_stats": True,
         "show_ball_on": True,
         "show_possession": True,
@@ -342,6 +358,10 @@ def get_settings():
         "team_colors": {},
         "docked": True,  # AppBar desktop reservation (False = floating always-on-top)
         "fullscreen_override_exes": [],  # EXE basenames that never hide the ticker
+        "use_proxy": False,
+        "proxy": "",
+        "use_cert": False,
+        "cert_file": "",
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -350,6 +370,9 @@ def get_settings():
             defaults.update(saved)
         except Exception:
             pass
+    saved_font = str(defaults.get("font") or "").strip()
+    if saved_font.lower() in _GENERIC_TICKER_FONTS:
+        defaults["font"] = "Ozone"
     with _SETTINGS_LOCK:
         _SETTINGS_CACHE = defaults
         return _SETTINGS_CACHE
@@ -365,6 +388,112 @@ def save_settings(settings):
         print(f"[SETTINGS] save failed: {e}")
     with _SETTINGS_LOCK:
         _SETTINGS_CACHE = settings
+
+
+def normalize_proxy_url(proxy_value):
+    """Ensure proxy URL has a scheme prefix (http:// added if missing)."""
+    if not proxy_value:
+        return ""
+    proxy_value = str(proxy_value).strip()
+    if not proxy_value:
+        return ""
+    if not proxy_value.lower().startswith(("http://", "https://")):
+        proxy_value = f"http://{proxy_value}"
+    return proxy_value
+
+
+_SYSTEM_CA_BUNDLE_PATH = ""
+
+
+def _build_system_ca_bundle():
+    """Merge certifi with Windows CA/ROOT stores for corporate SSL inspection."""
+    global _SYSTEM_CA_BUNDLE_PATH
+    if _SYSTEM_CA_BUNDLE_PATH and os.path.isfile(_SYSTEM_CA_BUNDLE_PATH):
+        return _SYSTEM_CA_BUNDLE_PATH
+    try:
+        import base64
+        import ssl
+        import certifi
+
+        with open(certifi.where(), "rb") as fh:
+            bundle = fh.read()
+        added = 0
+        if sys.platform == "win32":
+            for store in ("CA", "ROOT"):
+                try:
+                    for cert_bytes, encoding, _trust in ssl.enum_certificates(store):
+                        if isinstance(cert_bytes, bytes) and encoding == "x509_asn":
+                            pem = (
+                                b"-----BEGIN CERTIFICATE-----\n"
+                                + base64.encodebytes(cert_bytes)
+                                + b"-----END CERTIFICATE-----\n"
+                            )
+                            bundle += pem
+                            added += 1
+                except Exception:
+                    pass
+        os.makedirs(APPDATA_DIR, exist_ok=True)
+        dest = os.path.join(APPDATA_DIR, "system_ca_bundle.pem")
+        with open(dest, "wb") as fh:
+            fh.write(bundle)
+        _SYSTEM_CA_BUNDLE_PATH = dest
+        print(f"[SSL] System CA bundle built: {added} system root(s) → {dest}")
+        return dest
+    except Exception as exc:
+        print(f"[SSL] Could not build system CA bundle: {exc}")
+        return ""
+
+
+def apply_proxy_settings():
+    """Push proxy/cert into env so requests (and ESPN fetches) pick them up."""
+    settings = get_settings()
+    proxy_value = normalize_proxy_url(settings.get("proxy", ""))
+    if settings.get("use_proxy") and proxy_value:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[key] = proxy_value
+        print(f"[PROXY] Enabled: {proxy_value}")
+    else:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(key, None)
+
+    cert_file = settings.get("cert_file", "") or ""
+    if settings.get("use_cert") and cert_file and os.path.isfile(cert_file):
+        os.environ["REQUESTS_CA_BUNDLE"] = cert_file
+        os.environ["SSL_CERT_FILE"] = cert_file
+        print(f"[PROXY] Certificate: {cert_file}")
+        return
+
+    if settings.get("use_proxy") and proxy_value:
+        sys_bundle = _build_system_ca_bundle()
+        if sys_bundle:
+            os.environ["REQUESTS_CA_BUNDLE"] = sys_bundle
+            os.environ["SSL_CERT_FILE"] = sys_bundle
+            print(f"[PROXY] Using system CA bundle: {sys_bundle}")
+            return
+
+    local = os.environ.get("LOCALAPPDATA", "")
+    appdata_cacert = (
+        os.path.join(local, "NFL-TCKR", "certifi", "cacert.pem") if local else ""
+    )
+    if appdata_cacert and os.path.isfile(appdata_cacert):
+        os.environ["REQUESTS_CA_BUNDLE"] = appdata_cacert
+        os.environ["SSL_CERT_FILE"] = appdata_cacert
+    elif getattr(sys, "_MEIPASS", None):
+        meipass_cacert = os.path.join(sys._MEIPASS, "certifi", "cacert.pem")
+        if os.path.isfile(meipass_cacert):
+            os.environ["REQUESTS_CA_BUNDLE"] = meipass_cacert
+            os.environ["SSL_CERT_FILE"] = meipass_cacert
+    else:
+        os.environ.pop("REQUESTS_CA_BUNDLE", None)
+
+
+def _request_proxies():
+    """requests proxies dict, or None when proxy is off."""
+    settings = get_settings()
+    url = normalize_proxy_url(settings.get("proxy", ""))
+    if settings.get("use_proxy") and url:
+        return {"http": url, "https": url}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +730,33 @@ def get_football_icon(size=14):
 
 _RESOLVED_FONTS = {}
 _SYSTEM_FONT_FAMILIES = None
+_BUNDLED_FONT_FAMILIES = {}  # family name -> source filename
+
+
+def _font_search_dirs():
+    """Folders that may hold ticker .ttf/.otf files (dev tree, onefile extract, AppData)."""
+    dirs = []
+
+    def add(path):
+        if path and path not in dirs:
+            dirs.append(path)
+
+    add(os.path.join(APP_DIR, "fonts"))
+    add(APP_DIR)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        add(os.path.join(exe_dir, "fonts"))
+        add(exe_dir)
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            add(os.path.join(meipass, "fonts"))
+            add(meipass)
+    else:
+        add(os.path.join(REPO_ROOT, "fonts"))
+        add(os.path.join(REPO_ROOT, "docs"))
+    add(os.path.join(APPDATA_DIR, "fonts"))
+    add(APPDATA_DIR)
+    return dirs
 
 
 def _bundled_file_hint(requested):
@@ -619,14 +775,9 @@ def _bundled_file_hint(requested):
 
 
 def _bundled_font_files():
-    """ttf/otf files shipped in the project fonts folder."""
+    """ttf/otf files shipped in the project fonts folder (or the frozen extract)."""
     seen = set()
-    folders = (
-        os.path.join(APP_DIR, "fonts"),
-        os.path.join(REPO_ROOT, "fonts"),
-        os.path.join(REPO_ROOT, "docs"),
-    )
-    for folder in folders:
+    for folder in _font_search_dirs():
         if not os.path.isdir(folder):
             continue
         try:
@@ -642,6 +793,30 @@ def _bundled_font_files():
                 continue
             seen.add(key)
             yield path
+
+
+def register_all_font_files():
+    """Register every bundled .ttf/.otf with Qt. Call after QApplication exists."""
+    global _BUNDLED_FONT_FAMILIES, _SYSTEM_FONT_FAMILIES
+    if _SYSTEM_FONT_FAMILIES is None:
+        _SYSTEM_FONT_FAMILIES = set(QtGui.QFontDatabase().families())
+    registered = 0
+    for path in _bundled_font_files():
+        fid = QtGui.QFontDatabase.addApplicationFont(path)
+        if fid < 0:
+            print(f"[FONT] failed to register {os.path.basename(path)}", flush=True)
+            continue
+        registered += 1
+        for fam in QtGui.QFontDatabase.applicationFontFamilies(fid) or []:
+            if fam not in _BUNDLED_FONT_FAMILIES:
+                _BUNDLED_FONT_FAMILIES[fam] = os.path.basename(path)
+                print(f"[FONT] Registered '{fam}' from {os.path.basename(path)}", flush=True)
+    print(
+        f"[NFL-TCKR] bundled fonts: {registered} file(s) "
+        f"({len(_BUNDLED_FONT_FAMILIES)} family name(s))",
+        flush=True,
+    )
+    return registered
 
 
 def _font_name_score(requested, family):
@@ -716,8 +891,8 @@ def _load_bundled_font_file(filename):
 def resolve_font_family(requested, default="Arial Black"):
     """Installed family, then a match in fonts/, then default.
 
-    default is used as-is when it is already available, otherwise it is
-    resolved the same way (installed, then fonts/).
+    Frozen (exe) prefers a fonts-folder face so the bundle looks the same
+    on machines that do not have Ozone/Gotham installed.
     """
     requested = " ".join(str(requested or "").split())
     default = " ".join(str(default or "Arial Black").split()) or "Arial Black"
@@ -731,12 +906,34 @@ def resolve_font_family(requested, default="Arial Black"):
         # Captured once, before any fonts-folder file is registered.
         _SYSTEM_FONT_FAMILIES = set(QtGui.QFontDatabase().families())
     families = set(QtGui.QFontDatabase().families())
+    frozen = bool(getattr(sys, "frozen", False))
+
+    def _from_bundle(name):
+        best = None
+        best_score = 0
+        for fam in _BUNDLED_FONT_FAMILIES:
+            score = _font_name_score(name, fam)
+            if score > best_score:
+                best_score = score
+                best = fam
+        if best:
+            return best
+        return _load_bundled_family(name)
 
     def _pick(name, via_default):
         if not name:
             return None, None
+        if frozen:
+            loaded = _from_bundle(name)
+            if loaded:
+                families.add(loaded)
+                src = _BUNDLED_FONT_FAMILIES.get(loaded, "")
+                extra = f" fonts/{src}" if src else ""
+                source = (
+                    "default, fonts folder" if via_default else f"fonts folder{extra}"
+                )
+                return loaded, source
         if name in _SYSTEM_FONT_FAMILIES or name in families:
-            # families() also sees faces this process already loaded from fonts/.
             if name in _SYSTEM_FONT_FAMILIES:
                 source = "default, installed" if via_default else "installed"
             else:
@@ -777,6 +974,45 @@ def _font_debug_desc(font):
         face = f"{face} {style}"
     weight = "bold" if font.bold() else "regular"
     return f"{face} {font.pixelSize()}px {weight} (draws {info.family()})"
+
+
+def _ticker_font_request(settings):
+    """Ticker LED face: Ozone from fonts/, never leftover Arial from Settings.json."""
+    requested = str(settings.get("font") or "").strip() or "Ozone"
+    if requested.lower() in _GENERIC_TICKER_FONTS:
+        return "Ozone"
+    if _BUNDLED_FONT_FAMILIES:
+        if any(_font_name_score(requested, fam) > 0 for fam in _BUNDLED_FONT_FAMILIES):
+            return requested
+        return "Ozone"
+    return requested
+
+
+def _postgame_font_request(settings):
+    """Post-game stats face from Settings; generic leftovers fall back to Gotham Black."""
+    requested = str(settings.get("postgame_font") or "").strip()
+    if not requested:
+        requested = str(settings.get("player_info_font") or "").strip() or "Gotham Black"
+    if requested.lower() in _GENERIC_TICKER_FONTS:
+        return "Gotham Black"
+    return requested
+
+
+def _bundled_font_face_names():
+    bundled = sorted(_BUNDLED_FONT_FAMILIES.keys(), key=str.lower)
+    faces = ["Ozone"] + [f for f in bundled if f.lower() != "ozone"]
+    return faces or ["Ozone"]
+
+
+def _fill_font_combo(combo, selected):
+    for face in _bundled_font_face_names():
+        combo.addItem(face)
+    want = (selected or "").strip()
+    idx = combo.findText(want) if want else -1
+    if idx < 0 and want:
+        combo.addItem(want)
+        idx = combo.findText(want)
+    combo.setCurrentIndex(max(0, idx))
 
 
 def load_ticker_font():
@@ -1024,7 +1260,13 @@ def _http_get(url, params=None):
     label = _endpoint_label(url, params)
     t0 = time.monotonic()
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            proxies=_request_proxies(),
+        )
         ms = (time.monotonic() - t0) * 1000.0
         r.raise_for_status()
         data = r.json()
@@ -1146,20 +1388,175 @@ def _split_clock_line(text):
 
 
 def _sit_color_segments(text):
-    """Split a down line so '&' and '@' can be drawn white."""
+    """Split a down line so '&' and the 'on'/'ON' connector can be drawn white.
+
+    Only the standalone separator tokens are marked — '&' as a character and
+    'on'/'ON' as a whole word (word boundaries, case-insensitive), so letters
+    inside team names or other text are not whitened.
+    """
     parts = []
-    buf = []
-    for ch in text or "":
-        if ch in "&@":
-            if buf:
-                parts.append(("".join(buf), False))
-                buf = []
-            parts.append((ch, True))
-        else:
-            buf.append(ch)
-    if buf:
-        parts.append(("".join(buf), False))
+    src = text or ""
+    pos = 0
+    for m in re.finditer(r"&|\bon\b", src, flags=re.IGNORECASE):
+        if m.start() > pos:
+            parts.append((src[pos:m.start()], False))
+        parts.append((m.group(), True))
+        pos = m.end()
+    if pos < len(src):
+        parts.append((src[pos:], False))
     return parts
+
+
+def _as_bool(val):
+    """Coerce ESPN JSON booleans that sometimes arrive as strings."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return bool(val)
+
+
+def _is_fourth_down(situation, down_text=""):
+    """True when ESPN situation is 4th down (numeric or '4th…' text)."""
+    try:
+        if int(situation.get("down")) == 4:
+            return True
+    except (TypeError, ValueError, AttributeError):
+        pass
+    text = (down_text or "").strip().lower()
+    if not text and isinstance(situation, dict):
+        text = (
+            situation.get("downDistanceText")
+            or situation.get("shortDownDistanceText")
+            or ""
+        ).strip().lower()
+    return text.startswith("4th")
+
+
+def _short_network_name(name):
+    """Map ESPN broadcast labels to short ticker names (CBS, AMZN, …)."""
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    key = re.sub(r"\s+", " ", raw).lower()
+    mapped = {
+        "prime video": "AMZN",
+        "amazon prime video": "AMZN",
+        "amazon prime": "AMZN",
+        "amazon": "AMZN",
+        "nfl network": "NFLN",
+        "nfln": "NFLN",
+        "espn+": "ESPN+",
+        "espn plus": "ESPN+",
+        "disney+": "DISNEY+",
+        "peacock": "PEACOCK",
+        "netflix": "NFLX",
+        "paramount+": "P+",
+        "paramount plus": "P+",
+    }
+    if key in mapped:
+        return mapped[key]
+    # Already short network codes (CBS, FOX, NBC, ESPN, ABC, …)
+    if len(raw) <= 5:
+        return raw.upper()
+    return raw
+
+
+def _competition_broadcast(comp):
+    """One short national (or first) broadcast name from competition media."""
+    for bc in (comp or {}).get("broadcasts") or []:
+        names = bc.get("names") or []
+        if names:
+            short = _short_network_name(names[0])
+            if short:
+                return short
+    for geo in (comp or {}).get("geoBroadcasts") or []:
+        media = geo.get("media") or {}
+        short = _short_network_name(
+            media.get("shortName") or media.get("name") or geo.get("type", {}).get("shortName")
+        )
+        if short:
+            return short
+    return ""
+
+
+def _competition_spread(comp):
+    """Pregame spread text like 'NYJ -3.5' from competition odds details."""
+    odds = (comp or {}).get("odds") or []
+    if isinstance(odds, dict):
+        odds = [odds]
+    for entry in odds:
+        if not isinstance(entry, dict):
+            continue
+        details = (entry.get("details") or "").strip()
+        if details:
+            return details
+        spread = entry.get("spread")
+        if spread is None:
+            continue
+        fav = ""
+        for side in ("homeTeamOdds", "awayTeamOdds"):
+            side_odds = entry.get(side) or {}
+            if side_odds.get("favorite"):
+                team = side_odds.get("team") or {}
+                fav = (team.get("abbreviation") or "").strip()
+                if fav:
+                    break
+        try:
+            spr = abs(float(spread))
+        except (TypeError, ValueError):
+            continue
+        if fav:
+            return f"{fav} -{spr:g}"
+    return ""
+
+
+def _drive_summary_line(summary):
+    """Short current-drive line: '12 plays, 75 yards'. Empty if incomplete."""
+    drives = (summary or {}).get("drives") or {}
+    current = drives.get("current")
+    if not current:
+        return ""
+    plays = current.get("offensivePlays")
+    yards = current.get("yards")
+    if plays is None or yards is None:
+        # Some payloads only put the short form in description.
+        desc = (current.get("description") or "").strip()
+        match = re.match(
+            r"(\d+)\s+plays?,\s+(-?\d+)\s+yards?",
+            desc,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        plays, yards = match.group(1), match.group(2)
+    try:
+        plays_n = int(plays)
+        yards_n = int(yards)
+    except (TypeError, ValueError):
+        return ""
+    return f"{plays_n} plays, {yards_n} yards"
+
+
+def _sit_word_color(game, clock_blue, settings):
+    """Fill color for down/distance words (markers stay white separately).
+
+    Priority (highest wins): 4th down gold, else red zone, else possession
+    team color, else clock-blue / white.
+    """
+    if game.get("is_fourth_down"):
+        return "#FFD700"
+    if game.get("is_red_zone"):
+        return "#FF4040"
+    poss = str(game.get("possession_id") or "")
+    if poss:
+        if poss == str(game.get("away_id") or ""):
+            return get_team_color(game.get("away_name") or "", settings)
+        if poss == str(game.get("home_id") or ""):
+            return get_team_color(game.get("home_name") or "", settings)
+    return "#00BFFF" if clock_blue else "#FFFFFF"
 
 
 def _glyph_line(fm, text, fallback="A"):
@@ -1175,39 +1572,57 @@ def _glyph_line(fm, text, fallback="A"):
 
 
 def _live_center_rows(height, time_m, sit_m, play_m, clock_text, situation_line,
-                      play_lines, gap=1):
-    """Fixed vertical slots for live clock / down / two play lines.
+                      play_lines, gap=1, max_play_lines=2):
+    """Fixed vertical slots for live clock / down / play wrap lines.
 
     The clock row is always the same, even when down or last play is empty.
-    The four slots are centered in the bar as a group so the time sits in
-    the upper half (above the score midline) without hugging the top edge.
+    Slots are centered in the bar as a group so the time sits in the upper
+    half (above the score midline) without hugging the top edge.
+    Last-play lines are nudged down slightly; clock and down stay put.
+    max_play_lines is 2 or 3 — height fit may drop from 3 to 2.
     """
+    play_nudge = 2  # px; last-play only — do not move clock / down
+    n_play = 3 if int(max_play_lines) >= 3 else 2
     clock_h, clock_a = _glyph_line(time_m, clock_text or "0:00 - 2ND")
-    sit_h, sit_a = _glyph_line(sit_m, situation_line or "1st & 10 @ AAA 00")
+    sit_h, sit_a = _glyph_line(sit_m, situation_line or "1ST & 10 ON AAA 00")
     play_sample = (play_lines[0] if play_lines else "LAST PLAY")
     play_h, play_a = _glyph_line(play_m, play_sample)
     clock_to_sit = max(4, gap + 3)
     sit_to_play = max(3, gap + 2)
     play_to_play = gap
     reserved = (
-        clock_h + sit_h + 2 * play_h
-        + clock_to_sit + sit_to_play + play_to_play
+        clock_h + sit_h + n_play * play_h
+        + clock_to_sit + sit_to_play + play_to_play * (n_play - 1)
     )
     y0 = max(2, (int(height) - reserved) // 2)
     sit_y = y0 + clock_h + clock_to_sit
-    play_y = sit_y + sit_h + sit_to_play
+    play_y = sit_y + sit_h + sit_to_play + play_nudge
     play2_y = play_y + play_h + play_to_play
+    play3_y = play2_y + play_h + play_to_play
+    # Keep play lines inside the bar if the nudge would clip the bottom.
+    last_bottom = (play3_y if n_play >= 3 else play2_y) + play_h
+    overflow = last_bottom - int(height)
+    if overflow > 0:
+        play_y = max(sit_y + sit_h + sit_to_play, play_y - overflow)
+        play2_y = play_y + play_h + play_to_play
+        play3_y = play2_y + play_h + play_to_play
     return {
         "time": (y0, clock_a),
         "sit": (sit_y, sit_a),
         "play": (play_y, play_a),
         "play2": (play2_y, play_a),
+        "play3": (play3_y, play_a),
         "reserved": reserved,
+        "max_play_lines": n_play,
     }
 
 
 def _prepare_linescore(font, game, height, heading="", heading_font=None):
-    """Quarter table for a final: header, away, home. None if ESPN sent no lines."""
+    """Period table (Q1–Q4, OT if present): header, away, home. No total column.
+
+    None if ESPN sent no lines. OT / 2OT columns appear only when linescores
+    include those periods — never invented.
+    """
     away_q = list(game.get("away_lines") or [])
     home_q = list(game.get("home_lines") or [])
     if not away_q and not home_q:
@@ -1219,9 +1634,9 @@ def _prepare_linescore(font, game, height, heading="", heading_font=None):
         return [str(v) for v in vals[:n]]
 
     rows = [
-        [""] + [_period_header(i) for i in range(n)] + ["T"],
-        [str(game.get("away_abbr") or "").upper()] + _pad(away_q) + [str(game.get("away_score") or "0")],
-        [str(game.get("home_abbr") or "").upper()] + _pad(home_q) + [str(game.get("home_score") or "0")],
+        [""] + [_period_header(i) for i in range(n)],
+        [str(game.get("away_abbr") or "").upper()] + _pad(away_q),
+        [str(game.get("home_abbr") or "").upper()] + _pad(home_q),
     ]
     face = QtGui.QFont(font)
     # Smaller than the down/play faces; the heading stays the larger line.
@@ -1404,11 +1819,11 @@ def _athlete_jersey(athlete):
     return j
 
 
-def _qb_line_segments(name, yds, td, inter, jersey=""):
+def _qb_line_segments(name, yds, td, inter, jersey="", catt=""):
     """Mixed-size parts for under-name QB stats (same face; labels 1px smaller).
 
-    Format: #1 Ward 323 YDS, 1 TD, 0 INT
-    Full size (True): #jersey, last name, yards, TD count, INT count.
+    Format: #16 Lawrence 20/33 182 YDS, 3 TD, 1 INT
+    Full size (True): #jersey, last name, C/ATT, yards, TD count, INT count.
     Label size (False): spaces and YDS/TD/INT labels (+ punctuation). No 'QB'.
     """
     yds = str(yds).replace(",", "")
@@ -1419,6 +1834,13 @@ def _qb_line_segments(name, yds, td, inter, jersey=""):
     segs.extend([
         (str(name), True),
         (" ", False),
+    ])
+    if catt:
+        segs.extend([
+            (str(catt), True),
+            (" ", False),
+        ])
+    segs.extend([
         (str(yds), True),
         (" YDS, ", False),
         (str(td), True),
@@ -1429,9 +1851,9 @@ def _qb_line_segments(name, yds, td, inter, jersey=""):
     return segs
 
 
-def _format_qb_line(name, yds, td, inter, jersey=""):
+def _format_qb_line(name, yds, td, inter, jersey="", catt=""):
     """Plain-text QB stats line (debug / visual-key); see _qb_line_segments for size."""
-    return "".join(t for t, _ in _qb_line_segments(name, yds, td, inter, jersey))
+    return "".join(t for t, _ in _qb_line_segments(name, yds, td, inter, jersey, catt))
 
 
 def _qb_segments_width(segments, full_font, label_font, faux_bold=False):
@@ -1484,7 +1906,7 @@ def _draw_mixed_text(painter, x, y, segments, full_font, label_font, fill_color,
 
 
 def _parse_catt(catt):
-    """Parse '14/20' or '14-20' → (display '14-20', attempts int)."""
+    """Parse '14/20' or '14-20' → (display '14/20', attempts int)."""
     if not catt:
         return "", 0
     sep = "/" if "/" in catt else ("-" if "-" in catt else None)
@@ -1493,7 +1915,7 @@ def _parse_catt(catt):
     parts = catt.split(sep, 1)
     try:
         attempts = int(parts[1].replace(",", "").strip())
-        return f"{parts[0].strip()}-{parts[1].strip()}", attempts
+        return f"{parts[0].strip()}/{parts[1].strip()}", attempts
     except (ValueError, IndexError):
         return str(catt), 0
 
@@ -1530,16 +1952,253 @@ def _parse_passing_athletes(boxscore_players, team_id):
                 athlete = ath.get("athlete") or {}
                 last = _qb_last_name(athlete)
                 jersey = _athlete_jersey(athlete)
-                segs = _qb_line_segments(last, yds, td, inter, jersey)
+                segs = _qb_line_segments(last, yds, td, inter, jersey, completes)
                 qbs.append({
                     "name": last,
                     "jersey": jersey,
-                    "line": _format_qb_line(last, yds, td, inter, jersey),
+                    "line": _format_qb_line(last, yds, td, inter, jersey, completes),
                     "segments": segs,
                     "attempts": attempts,
                     "scope": "game",
                 })
     return qbs
+
+
+def _stat_col_index(labels, keys, *names):
+    """Index of a boxscore column by label or key (case-insensitive)."""
+    lab = [str(x).upper() for x in (labels or [])]
+    kee = [str(x).upper() for x in (keys or [])]
+    for name in names:
+        n = str(name).upper()
+        if n in lab:
+            return lab.index(n)
+        if n in kee:
+            return kee.index(n)
+    return -1
+
+
+def _stat_float(value):
+    try:
+        return float(str(value or "0").replace(",", "").replace("T", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def _stat_compact(value):
+    """'181' or '1.5' with no thousands separators."""
+    s = str(value or "").replace(",", "").strip()
+    if not s:
+        return ""
+    try:
+        n = float(s)
+        if n == int(n):
+            return str(int(n))
+        return s
+    except ValueError:
+        return s
+
+
+def _stat_at(stats, labels, keys, *names):
+    idx = _stat_col_index(labels, keys, *names)
+    if idx < 0 or idx >= len(stats or []):
+        return ""
+    return str((stats or [])[idx] or "").strip()
+
+
+def _boxscore_block(players, team_id, abbr=""):
+    tid = str(team_id or "")
+    ab = (abbr or "").upper()
+    for block in players or []:
+        team = block.get("team") or {}
+        if tid and str(team.get("id") or "") == tid:
+            return block
+    if ab:
+        for block in players or []:
+            team = block.get("team") or {}
+            if (team.get("abbreviation") or "").upper() == ab:
+                return block
+    return None
+
+
+def _boxscore_category(block, *names):
+    want = {n.lower() for n in names}
+    for cat in (block or {}).get("statistics") or []:
+        if (cat.get("name") or "").lower() in want:
+            return cat
+        if (cat.get("displayName") or "").lower() in want:
+            return cat
+    return None
+
+
+def _unwrap_boxscore_athlete(row_or_athlete):
+    if isinstance(row_or_athlete, dict):
+        inner = row_or_athlete.get("athlete")
+        if isinstance(inner, dict):
+            return inner
+        return row_or_athlete
+    return {}
+
+
+def _athlete_short_dot_name(athlete):
+    """ESPN shortName ('C. Ward') or first-initial + last name."""
+    athlete = _unwrap_boxscore_athlete(athlete)
+    if not isinstance(athlete, dict):
+        return "Player"
+    short = (athlete.get("shortName") or "").strip()
+    if short:
+        return short
+    last = format_player_lastname(athlete)
+    first = (athlete.get("firstName") or "").strip()
+    if first:
+        return f"{first[0].upper()}. {last}"
+    disp = (athlete.get("displayName") or athlete.get("fullName") or "").strip()
+    parts = disp.split()
+    if len(parts) >= 2 and parts[0]:
+        return f"{parts[0][0].upper()}. {last}"
+    return last or "Player"
+
+
+def _athlete_pos_abbr(athlete):
+    athlete = _unwrap_boxscore_athlete(athlete)
+    if not isinstance(athlete, dict):
+        return ""
+    pos = athlete.get("position")
+    if isinstance(pos, dict):
+        return (pos.get("abbreviation") or pos.get("displayName") or "").strip().upper()
+    if isinstance(pos, str):
+        return pos.strip().upper()
+    return ""
+
+
+def _postgame_player_clause(athlete, bits):
+    name = _athlete_short_dot_name(athlete)
+    pos = _athlete_pos_abbr(athlete)
+    head = f"{name} {pos}".strip() if pos else name
+    extras = [b for b in bits if b]
+    if extras:
+        return f"{head}, {', '.join(extras)}"
+    return head
+
+
+def _pick_boxscore_leader(cat, *score_names):
+    """Athlete with the highest numeric value in the named column; else first listed."""
+    if not cat:
+        return None, [], [], [], -1, 0.0
+    labels = cat.get("labels") or []
+    keys = cat.get("keys") or cat.get("names") or []
+    athletes = cat.get("athletes") or []
+    idx = _stat_col_index(labels, keys, *score_names)
+    if not athletes:
+        return None, [], labels, keys, idx, 0.0
+    best = athletes[0]
+    best_n = -1.0
+    if idx >= 0:
+        for ath in athletes:
+            stats = ath.get("stats") or []
+            n = _stat_float(stats[idx] if idx < len(stats) else 0)
+            if n > best_n:
+                best_n = n
+                best = ath
+    else:
+        best_n = 0.0
+    return best, best.get("stats") or [], labels, keys, idx, best_n
+
+
+def _postgame_td_bit(td):
+    """'1TD' when the leader scored; omit 0 TD."""
+    if _stat_float(td) <= 0:
+        return ""
+    compact = _stat_compact(td)
+    return f"{compact}TD" if compact else ""
+
+
+def _parse_postgame_leaders(boxscore_players, team_id, abbr, team_full):
+    """Away/home crawl: PASS / RUSH / REC / SACKS / TACKLE leaders from boxscore."""
+    nick = get_team_nickname(team_full) or ""
+    tag = (NFL_CITY_ABBR.get(nick) or abbr or nick or "TEAM").upper()
+    block = _boxscore_block(boxscore_players, team_id, abbr)
+    sections = []
+    if not block:
+        return {"nick": nick, "tag": tag, "team_full": team_full or "", "sections": sections}
+
+    passing = _boxscore_category(block, "passing")
+    passer, stats, labels, keys, _idx, _n = _pick_boxscore_leader(
+        passing, "YDS", "passingYards",
+    )
+    if passer:
+        catt_raw = _stat_at(stats, labels, keys, "C/ATT", "CMP/ATT")
+        catt, _att = _parse_catt(catt_raw) if catt_raw else ("", 0)
+        if not catt:
+            cmp_ = _stat_compact(_stat_at(stats, labels, keys, "CMP", "COMP", "C", "completions"))
+            att = _stat_compact(_stat_at(stats, labels, keys, "ATT", "passingAttempts"))
+            if cmp_ and att:
+                catt = f"{cmp_}/{att}"
+        yds = _stat_compact(_stat_at(stats, labels, keys, "YDS", "passingYards"))
+        td = _stat_compact(_stat_at(stats, labels, keys, "TD", "passingTouchdowns"))
+        bits = []
+        if catt:
+            bits.append(catt)
+        if yds:
+            bits.append(f"{yds}YDS")
+        td_bit = _postgame_td_bit(td)
+        if td_bit:
+            bits.append(td_bit)
+        sections.append((f"{tag} PASS", _postgame_player_clause(passer, bits)))
+
+    rushing = _boxscore_category(block, "rushing")
+    rusher, stats, labels, keys, _idx, _n = _pick_boxscore_leader(
+        rushing, "YDS", "rushingYards",
+    )
+    if rusher:
+        car = _stat_compact(_stat_at(stats, labels, keys, "CAR", "ATT", "rushingAttempts"))
+        yds = _stat_compact(_stat_at(stats, labels, keys, "YDS", "rushingYards"))
+        td = _stat_compact(_stat_at(stats, labels, keys, "TD", "rushingTouchdowns"))
+        bits = []
+        if car:
+            bits.append(f"{car}CAR")
+        if yds:
+            bits.append(f"{yds}YDS")
+        td_bit = _postgame_td_bit(td)
+        if td_bit:
+            bits.append(td_bit)
+        sections.append(("RUSH", _postgame_player_clause(rusher, bits)))
+
+    receiving = _boxscore_category(block, "receiving")
+    recvr, stats, labels, keys, _idx, _n = _pick_boxscore_leader(
+        receiving, "YDS", "receivingYards",
+    )
+    if recvr:
+        rec = _stat_compact(_stat_at(stats, labels, keys, "REC", "receptions"))
+        yds = _stat_compact(_stat_at(stats, labels, keys, "YDS", "receivingYards"))
+        td = _stat_compact(_stat_at(stats, labels, keys, "TD", "receivingTouchdowns"))
+        bits = []
+        if rec:
+            bits.append(f"{rec}REC")
+        if yds:
+            bits.append(f"{yds}YDS")
+        td_bit = _postgame_td_bit(td)
+        if td_bit:
+            bits.append(td_bit)
+        sections.append(("REC", _postgame_player_clause(recvr, bits)))
+
+    defense = _boxscore_category(block, "defensive", "defense")
+    sacker, stats, labels, keys, _idx, sacks_n = _pick_boxscore_leader(
+        defense, "SACKS", "SACK", "sacks",
+    )
+    if sacker and sacks_n > 0:
+        sck = _stat_compact(_stat_at(stats, labels, keys, "SACKS", "SACK", "sacks"))
+        if sck:
+            sections.append(("SACKS", _postgame_player_clause(sacker, [f"{sck}SCK"])))
+
+    tackler, stats, labels, keys, _idx, tck_n = _pick_boxscore_leader(
+        defense, "TOT", "TOTAL", "totalTackles", "SOLO",
+    )
+    if tackler and tck_n > 0:
+        tck = _stat_compact(_stat_at(stats, labels, keys, "TOT", "TOTAL", "totalTackles", "SOLO"))
+        if tck:
+            sections.append(("TACKLE", _postgame_player_clause(tackler, [f"{tck}TCK"])))
+
+    return {"nick": nick, "tag": tag, "team_full": team_full or "", "sections": sections}
 
 
 def _parse_season_leader_display(display_value):
@@ -1552,7 +2211,7 @@ def _parse_season_leader_display(display_value):
     m = re.match(r"^(\d+)\s*[/-]\s*(\d+)\s*,?\s*(.*)$", text)
     rest = text
     if m:
-        completes = f"{m.group(1)}-{m.group(2)}"
+        completes = f"{m.group(1)}/{m.group(2)}"
         attempts = int(m.group(2))
         rest = m.group(3)
     y = re.search(r"([\d,]+)\s*YDS", rest, re.I)
@@ -1590,11 +2249,11 @@ def _season_qbs_from_competitors(comp, team_id):
                 athlete = lead.get("athlete") or {}
                 last = _qb_last_name(athlete)
                 jersey = _athlete_jersey(athlete)
-                segs = _qb_line_segments(last, yds, td, inter, jersey)
+                segs = _qb_line_segments(last, yds, td, inter, jersey, completes)
                 qbs.append({
                     "name": last,
                     "jersey": jersey,
-                    "line": _format_qb_line(last, yds, td, inter, jersey),
+                    "line": _format_qb_line(last, yds, td, inter, jersey, completes),
                     "segments": segs,
                     "attempts": attempts or QB_MIN_ATTEMPTS,
                     "scope": "season",
@@ -1613,6 +2272,8 @@ def _situation_fields(situation, status_type):
         "period": "",
         "away_timeouts": None,
         "home_timeouts": None,
+        "is_red_zone": False,
+        "is_fourth_down": False,
     }
     if not situation:
         return out
@@ -1629,8 +2290,10 @@ def _situation_fields(situation, status_type):
             dist_n = 0
         dd = f"{ordinal} & {dist_n}" if ordinal and dist_n > 0 else ""
     out["down_distance"] = _clean_down_distance(dd)
+    out["is_red_zone"] = _as_bool(situation.get("isRedZone"))
+    out["is_fourth_down"] = _is_fourth_down(situation, out["down_distance"] or dd)
 
-    # Raw yard spot ("NYG 45"); the card composes "2nd & 22 @ NYG 45".
+    # Raw yard spot ("NYG 45"); the card composes "2nd & 22 on NYG 45".
     out["ball_on"] = (situation.get("possessionText") or "").strip()
     out["possession_id"] = str(situation.get("possession") or "")
     out["away_timeouts"] = _timeout_remaining(situation.get("awayTimeouts"))
@@ -1649,10 +2312,10 @@ def _situation_fields(situation, status_type):
 
 
 def _live_situation_line(down, ball_on):
-    """Down and spot for the live center, e.g. '2nd & 22 @ NYG 45'.
+    """Down and spot for the live center, e.g. '2nd & 22 on NYG 45'.
 
     ESPN downDistanceText often already ends with 'at NYG 47'. Drop that
-    clause and keep the '@ NYG 47' spot.
+    clause and keep the 'on NYG 47' spot.
     """
     down = (down or "").strip()
     spot = (ball_on or "").strip()
@@ -1660,11 +2323,11 @@ def _live_situation_line(down, ball_on):
         spot = spot[8:].strip()
     if down and spot:
         down = re.sub(r"\s+at\s+.+$", "", down, count=1, flags=re.IGNORECASE).strip()
-        return f"{down} @ {spot}" if down else f"@ {spot}"
+        return f"{down} on {spot}" if down else f"on {spot}"
     if down:
         return down
     if spot:
-        return f"@ {spot}"
+        return f"on {spot}"
     return ""
 
 
@@ -1708,14 +2371,47 @@ def _extract_scoring_plays(summary):
     return out
 
 
-def format_scoring_alert_message(play, team_label):
-    """Build MLB-style flash text, e.g. 'Giants Score: PASS Beckham Jr. 44yd Touchdown!'."""
+def _scoring_alert_team_label(play, team_label):
+    """Nickname casing for scoring flash (Giants, not GIANTS)."""
     label = (team_label or "TEAM").strip()
     if label:
         label = label[0].upper() + label[1:] if len(label) > 1 else label.upper()
-    # Prefer nickname casing like examples (Giants, not GIANTS) — title-case nickname
-    nick = get_team_nickname(play.get("team_full") or "") or label
-    label = nick
+    return get_team_nickname(play.get("team_full") or "") or label
+
+
+def format_scoring_alert_headline(play, team_label):
+    """Short all-caps hold line, e.g. 'GIANTS TOUCHDOWN!'."""
+    nick = _scoring_alert_team_label(play, team_label).upper()
+    raw = play.get("text") or ""
+    type_text = (play.get("type_text") or "").lower()
+    scoring = (play.get("scoring_name") or "").lower()
+    main = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip() or raw
+
+    if "field goal" in type_text or scoring in ("field-goal", "fieldgoal"):
+        return f"{nick} FIELD GOAL!"
+    if "safety" in type_text or scoring == "safety":
+        return f"{nick} SAFETY!"
+    if "two-point" in type_text or "two point" in main.lower() or scoring in (
+        "two-point-conversion", "2pt",
+    ):
+        return f"{nick} TWO-POINT!"
+    if "extra point" in type_text or scoring in ("extra-point", "pat"):
+        return f"{nick} EXTRA POINT!"
+    if (
+        scoring == "touchdown"
+        or "touchdown" in type_text
+        or "pass" in type_text
+        or "rush" in type_text
+        or re.search(r"\bpass from\b", main, re.I)
+        or re.search(r"\bRush\b", main)
+    ):
+        return f"{nick} TOUCHDOWN!"
+    return f"{nick} SCORE!"
+
+
+def format_scoring_alert_message(play, team_label):
+    """Detail flash text, e.g. 'Giants Score: Scattebo 22 YD Run Touchdown!'."""
+    label = _scoring_alert_team_label(play, team_label)
 
     raw = play.get("text") or ""
     type_text = (play.get("type_text") or "").lower()
@@ -1725,15 +2421,18 @@ def format_scoring_alert_message(play, team_label):
     if "field goal" in type_text or scoring in ("field-goal", "fieldgoal"):
         m = re.match(r"^(.+?)\s+(\d+)\s*Yds?\s+Field Goal", main, re.I)
         if m:
-            return f"{label} Score: FIELD GOAL {_short_player_name(m.group(1))} {m.group(2)} yd"
+            return (
+                f"{label} Score: {_short_player_name(m.group(1))} "
+                f"{m.group(2)} YD Field Goal!"
+            )
         return f"{label} Score: FIELD GOAL {main}"
 
     if "pass" in type_text or re.search(r"\bpass from\b", main, re.I):
         m = re.match(r"^(.+?)\s+(\d+)\s*Yds?\s+pass\s+from\s+(.+)$", main, re.I)
         if m:
             return (
-                f"{label} Score: PASS {_short_player_name(m.group(1))} "
-                f"{m.group(2)}yd Touchdown!"
+                f"{label} Score: {_short_player_name(m.group(1))} "
+                f"{m.group(2)} YD Pass Touchdown!"
             )
         return f"{label} Score: PASS {main} Touchdown!"
 
@@ -1741,8 +2440,8 @@ def format_scoring_alert_message(play, team_label):
         m = re.match(r"^(.+?)\s+(\d+)\s*Yds?\s+Rush", main, re.I)
         if m:
             return (
-                f"{label} Score: RUN {_short_player_name(m.group(1))} "
-                f"{m.group(2)}yd Touchdown!"
+                f"{label} Score: {_short_player_name(m.group(1))} "
+                f"{m.group(2)} YD Run Touchdown!"
             )
         return f"{label} Score: RUN {main} Touchdown!"
 
@@ -1821,15 +2520,19 @@ def _parse_event(event, summary=None):
     sit = _situation_fields(situation, stype)
     if not sit["last_play"] and summary:
         sit["last_play"] = _last_play_from_drives(summary)
+    drive_summary = _drive_summary_line(summary) if summary else ""
 
-    # For finals: center "F", never show last-play text under the score
+    # For finals: no live situation rows (compact quarter digits under scores)
     if state == "post":
-        sit["down_distance"] = "F"
+        sit["down_distance"] = ""
         sit["last_play"] = ""
         sit["ball_on"] = ""
         sit["possession_id"] = ""
         sit["away_timeouts"] = None
         sit["home_timeouts"] = None
+        sit["is_red_zone"] = False
+        sit["is_fourth_down"] = False
+        drive_summary = ""
 
     # Kickoff time for scheduled
     start = comp.get("date") or event.get("date") or ""
@@ -1842,6 +2545,10 @@ def _parse_event(event, summary=None):
             kickoff_local = local.strftime("%I:%M %p").lstrip("0")
         except Exception:
             kickoff_local = stype.get("shortDetail") or ""
+
+    # Pregame-only broadcast / spread (hidden once the game is live or final)
+    broadcast = _competition_broadcast(comp) if state == "pre" else ""
+    spread = _competition_spread(comp) if state == "pre" else ""
 
     # QB stats:
     #   live / final  → this game's boxscore passing (summary)
@@ -1870,11 +2577,11 @@ def _parse_event(event, summary=None):
                         continue
                     last = _qb_last_name(ath)
                     jersey = _athlete_jersey(ath)
-                    segs = _qb_line_segments(last, yds, td, inter, jersey)
+                    segs = _qb_line_segments(last, yds, td, inter, jersey, completes)
                     entry = {
                         "name": last,
                         "jersey": jersey,
-                        "line": _format_qb_line(last, yds, td, inter, jersey),
+                        "line": _format_qb_line(last, yds, td, inter, jersey, completes),
                         "segments": segs,
                         "attempts": attempts or QB_MIN_ATTEMPTS,
                         "scope": "season",
@@ -1885,6 +2592,13 @@ def _parse_event(event, summary=None):
                         home_qbs.append(entry)
 
     scoring_plays = _extract_scoring_plays(summary) if summary else []
+
+    away_post = {"nick": "", "team_full": "", "sections": []}
+    home_post = {"nick": "", "team_full": "", "sections": []}
+    if state == "post" and summary:
+        players = (summary.get("boxscore") or {}).get("players") or []
+        away_post = _parse_postgame_leaders(players, a["id"], a["abbr"], a["full"])
+        home_post = _parse_postgame_leaders(players, h["id"], h["abbr"], h["full"])
 
     return {
         "game_id": str(event.get("id") or comp.get("id") or ""),
@@ -1905,16 +2619,369 @@ def _parse_event(event, summary=None):
         "home_record": h["record"],
         "away_qbs": away_qbs,
         "home_qbs": home_qbs,
+        "away_post": away_post,
+        "home_post": home_post,
         "down_distance": sit["down_distance"],
         "ball_on": sit["ball_on"],
         "last_play": sit["last_play"],
+        "drive_summary": drive_summary,
         "possession_id": sit["possession_id"],
+        "is_red_zone": bool(sit.get("is_red_zone")),
+        "is_fourth_down": bool(sit.get("is_fourth_down")),
         "away_timeouts": sit["away_timeouts"],
         "home_timeouts": sit["home_timeouts"],
+        "broadcast": broadcast,
+        "spread": spread,
         "kickoff": kickoff_local,
         "start": start,
         "scoring_plays": scoring_plays,
     }
+
+
+def _empty_post_leaders():
+    return {"nick": "", "team_full": "", "sections": []}
+
+
+def _test_game(
+    *,
+    game_id,
+    state,
+    away_name,
+    home_name,
+    away_id,
+    home_id,
+    away_abbr,
+    home_abbr,
+    away_score="0",
+    home_score="0",
+    away_lines=None,
+    home_lines=None,
+    away_record="",
+    home_record="",
+    status="Scheduled",
+    status_detail="",
+    down_distance="",
+    ball_on="",
+    last_play="",
+    drive_summary="",
+    possession_id="",
+    is_red_zone=False,
+    is_fourth_down=False,
+    away_timeouts=None,
+    home_timeouts=None,
+    broadcast="",
+    spread="",
+    kickoff="",
+    away_qbs=None,
+    home_qbs=None,
+    scoring_plays=None,
+):
+    """Normalized game dict matching `_parse_event` / `self.games` shape."""
+    return {
+        "game_id": str(game_id),
+        "state": state,
+        "status": status,
+        "status_detail": status_detail,
+        "away_name": away_name,
+        "home_name": home_name,
+        "away_id": str(away_id),
+        "home_id": str(home_id),
+        "away_abbr": away_abbr,
+        "home_abbr": home_abbr,
+        "away_score": str(away_score),
+        "home_score": str(home_score),
+        "away_lines": list(away_lines or []),
+        "home_lines": list(home_lines or []),
+        "away_record": away_record,
+        "home_record": home_record,
+        "away_qbs": list(away_qbs or []),
+        "home_qbs": list(home_qbs or []),
+        "away_post": _empty_post_leaders(),
+        "home_post": _empty_post_leaders(),
+        "down_distance": down_distance,
+        "ball_on": ball_on,
+        "last_play": last_play,
+        "drive_summary": drive_summary,
+        "possession_id": str(possession_id or ""),
+        "is_red_zone": bool(is_red_zone),
+        "is_fourth_down": bool(is_fourth_down),
+        "away_timeouts": away_timeouts,
+        "home_timeouts": home_timeouts,
+        "broadcast": broadcast,
+        "spread": spread,
+        "kickoff": kickoff,
+        "start": "",
+        "scoring_plays": list(scoring_plays or []),
+    }
+
+
+def build_test_games():
+    """Fake slate for `-test` / `--test` — no ESPN. Same shape as fetch output."""
+    # 1) Live red zone, 1st down, clock > 2:00, possession + timeouts
+    rz = _test_game(
+        game_id="test-rz",
+        state="in",
+        status="In Progress",
+        status_detail="3:42 - 3rd",
+        away_name="Kansas City Chiefs",
+        home_name="Buffalo Bills",
+        away_id="test-kc",
+        home_id="test-buf",
+        away_abbr="KC",
+        home_abbr="BUF",
+        away_score="17",
+        home_score="20",
+        away_lines=["7", "3", "7"],
+        home_lines=["7", "7", "6"],
+        down_distance="1st & Goal",
+        ball_on="BUF 8",
+        last_play="Mahomes pass complete to Kelce for 12 yards",
+        possession_id="test-kc",
+        is_red_zone=True,
+        is_fourth_down=False,
+        away_timeouts=2,
+        home_timeouts=3,
+    )
+    # 2) Live 4th down under 2:00 (gold clock + gold down line)
+    fd = _test_game(
+        game_id="test-4th",
+        state="in",
+        status="In Progress",
+        status_detail="1:45 - 4th",
+        away_name="Philadelphia Eagles",
+        home_name="Dallas Cowboys",
+        away_id="test-phi",
+        home_id="test-dal",
+        away_abbr="PHI",
+        home_abbr="DAL",
+        away_score="24",
+        home_score="21",
+        away_lines=["7", "10", "0", "7"],
+        home_lines=["0", "7", "7", "7"],
+        down_distance="4th & 2",
+        ball_on="DAL 38",
+        last_play="Hurts rush for 3 yards to the DAL 38",
+        possession_id="test-phi",
+        is_red_zone=False,
+        is_fourth_down=True,
+        away_timeouts=1,
+        home_timeouts=2,
+    )
+    # 3) Live midfield — last play + drive summary for both settings
+    mid = _test_game(
+        game_id="test-mid",
+        state="in",
+        status="In Progress",
+        status_detail="8:15 - 2nd",
+        away_name="Green Bay Packers",
+        home_name="Detroit Lions",
+        away_id="test-gb",
+        home_id="test-det",
+        away_abbr="GB",
+        home_abbr="DET",
+        away_score="14",
+        home_score="10",
+        away_lines=["7", "7"],
+        home_lines=["3", "7"],
+        down_distance="2nd & 7",
+        ball_on="GB 45",
+        last_play="Love pass incomplete intended for Doubs",
+        drive_summary="12 plays, 75 yards",
+        possession_id="test-gb",
+        is_red_zone=False,
+        is_fourth_down=False,
+        away_timeouts=3,
+        home_timeouts=3,
+    )
+    # 4) Final Q1–Q4 linescores (center table, no total column)
+    fin = _test_game(
+        game_id="test-final",
+        state="post",
+        status="Final",
+        status_detail="Final",
+        away_name="San Francisco 49ers",
+        home_name="Seattle Seahawks",
+        away_id="test-sf",
+        home_id="test-sea",
+        away_abbr="SF",
+        home_abbr="SEA",
+        away_score="28",
+        home_score="24",
+        away_lines=["7", "10", "3", "8"],
+        home_lines=["0", "7", "10", "7"],
+    )
+    # 5) Final with OT period in linescores
+    ot = _test_game(
+        game_id="test-ot",
+        state="post",
+        status="Final/OT",
+        status_detail="Final/OT",
+        away_name="Baltimore Ravens",
+        home_name="Pittsburgh Steelers",
+        away_id="test-bal",
+        home_id="test-pit",
+        away_abbr="BAL",
+        home_abbr="PIT",
+        away_score="27",
+        home_score="24",
+        away_lines=["3", "7", "7", "7", "3"],
+        home_lines=["7", "3", "7", "7", "0"],
+    )
+    # 6) Pregame — kickoff, records, network, spread
+    pre = _test_game(
+        game_id="test-pre",
+        state="pre",
+        status="Scheduled",
+        status_detail="Sun, 4:25 PM",
+        away_name="Miami Dolphins",
+        home_name="New York Jets",
+        away_id="test-mia",
+        home_id="test-nyj",
+        away_abbr="MIA",
+        home_abbr="NYJ",
+        away_record="4-1",
+        home_record="3-2",
+        kickoff="4:25 PM",
+        broadcast="CBS",
+        spread="NYJ -3.5",
+    )
+    return [rz, fd, mid, fin, ot, pre]
+
+
+_TEST_PLAY_LINES = (
+    "Pass complete for 8 yards to the stick",
+    "Rush up the middle for 3 yards",
+    "Incomplete pass broken up in coverage",
+    "Screen pass for 12 yards and a first down",
+    "Sack — loss of 6 yards",
+    "Field goal is good from 41 yards",
+)
+
+_TEST_DOWN_CYCLE = (
+    ("1st & 10", False),
+    ("2nd & 7", False),
+    ("3rd & 5", False),
+    ("4th & 2", True),
+)
+
+_TEST_RZ_DOWN_CYCLE = (
+    ("1st & Goal", False),
+    ("2nd & Goal", False),
+    ("3rd & 3", False),
+    ("4th & 1", True),
+)
+
+_TEST_SPOTS = ("GB 45", "DET 48", "GB 38", "50", "DET 42", "GB 33")
+
+
+def _advance_test_clock(status_detail, seconds=7):
+    """Tick a live clock string like '3:42 - 3rd' down; wrap within the quarter."""
+    text = (status_detail or "").strip()
+    match = re.match(
+        r"^(\d{1,2}):(\d{2})(\s*-\s*)(.+)$",
+        text,
+    )
+    if not match:
+        return text
+    total = int(match.group(1)) * 60 + int(match.group(2))
+    total = max(0, total - seconds)
+    if total <= 0:
+        # Keep a visible under-2:00 or mid-quarter clock so gold / blue still demo
+        quarter = (match.group(4) or "").strip().lower()
+        if quarter in ("2nd", "4th", "ot"):
+            total = 95  # 1:35 — under two minutes
+        else:
+            total = 185  # 3:05 — over two minutes
+    return f"{total // 60}:{total % 60:02d}{match.group(3)}{match.group(4)}"
+
+
+def advance_test_games(games, tick):
+    """Mutate live fake games in place for one -test timer tick. Returns games."""
+    if not games:
+        return games
+    live = [g for g in games if g.get("state") == "in"]
+    if not live:
+        return games
+
+    down_i = tick % len(_TEST_DOWN_CYCLE)
+    rz_i = tick % len(_TEST_RZ_DOWN_CYCLE)
+    play = _TEST_PLAY_LINES[tick % len(_TEST_PLAY_LINES)]
+    spot = _TEST_SPOTS[tick % len(_TEST_SPOTS)]
+
+    for g in live:
+        g["status_detail"] = _advance_test_clock(g.get("status_detail") or "")
+        gid = g.get("game_id")
+
+        if gid == "test-rz":
+            dd, is4 = _TEST_RZ_DOWN_CYCLE[rz_i]
+            g["down_distance"] = dd
+            g["is_fourth_down"] = is4
+            # Toggle red zone every other down step so both colors show
+            g["is_red_zone"] = (rz_i % 2 == 0) or not is4
+            if is4:
+                g["is_red_zone"] = False  # 4th-down gold wins; clear RZ for clarity
+            yards = 9 - (rz_i % 4)
+            g["ball_on"] = f"BUF {max(1, yards)}"
+            g["last_play"] = play
+            if tick % 5 == 0:
+                # Swap possession occasionally
+                aid, hid = g.get("away_id"), g.get("home_id")
+                g["possession_id"] = hid if g.get("possession_id") == aid else aid
+
+        elif gid == "test-4th":
+            # Stay on 4th under 2:00 most ticks; briefly show other downs
+            if tick % 6 == 0:
+                dd, is4 = _TEST_DOWN_CYCLE[down_i]
+                g["down_distance"] = dd
+                g["is_fourth_down"] = is4
+            else:
+                g["down_distance"] = "4th & 2"
+                g["is_fourth_down"] = True
+            g["is_red_zone"] = False
+            # Keep clock under 2:00 in 4th for gold clock demo
+            if not _clock_under_two_minutes(g.get("status_detail") or ""):
+                g["status_detail"] = "1:45 - 4th"
+            g["ball_on"] = f"DAL {38 - (tick % 5)}"
+            g["last_play"] = play
+            if tick % 7 == 0:
+                aid, hid = g.get("away_id"), g.get("home_id")
+                g["possession_id"] = hid if g.get("possession_id") == aid else aid
+
+        elif gid == "test-mid":
+            dd, is4 = _TEST_DOWN_CYCLE[down_i]
+            g["down_distance"] = dd
+            g["is_fourth_down"] = is4
+            g["is_red_zone"] = False
+            g["ball_on"] = spot
+            g["last_play"] = play
+            plays_n = 8 + (tick % 8)
+            yards_n = 35 + (tick * 5) % 50
+            g["drive_summary"] = f"{plays_n} plays, {yards_n} yards"
+            if tick % 6 == 0:
+                aid, hid = g.get("away_id"), g.get("home_id")
+                g["possession_id"] = hid if g.get("possession_id") == aid else aid
+            # Occasional score bump + new scoring_play so the existing alert path can fire
+            if tick > 0 and tick % 10 == 0:
+                try:
+                    home = int(g.get("home_score") or 0)
+                except (TypeError, ValueError):
+                    home = 0
+                home += 7
+                g["home_score"] = str(home)
+                plays = list(g.get("scoring_plays") or [])
+                pid = f"test-score-{tick}"
+                plays.append({
+                    "id": pid,
+                    "text": "Amon-Ra St. Brown 15 Yd pass from Jared Goff",
+                    "type_text": "Passing Touchdown",
+                    "scoring_name": "touchdown",
+                    "team_id": str(g.get("home_id") or ""),
+                    "team_full": g.get("home_name") or "",
+                    "team_abbr": g.get("home_abbr") or "",
+                })
+                g["scoring_plays"] = plays
+
+    return games
 
 
 def fetch_nfl_games(settings=None):
@@ -2062,7 +3129,7 @@ _GLOW_TEXT_PAD = 22   # extra room so text bloom can spread past glyphs
 
 
 def _approx_blur_pixmap(pm, strength=3):
-    """Cheap soft blur via downscale→upscale (no Qt GraphicsBlur needed)."""
+    """Soft blur via downscale then upscale (no Qt GraphicsBlur needed)."""
     if pm is None or pm.isNull() or strength <= 1:
         return pm
     w, h = pm.width(), pm.height()
@@ -2077,6 +3144,30 @@ def _approx_blur_pixmap(pm, strength=3):
 
 
 _GLOW_LAYER_CACHE = {}
+_LOGO_GLOW_CACHE = {}
+_ICON_GLOW_CACHE = {}
+
+
+def _glow_cache_get(cache, key):
+    with _IMAGE_CACHE_LOCK:
+        cached = cache.get(key)
+        if cached is None:
+            return None
+        # Insertion order is recency. A hit must not drop the entry.
+        del cache[key]
+        cache[key] = cached
+        return cached
+
+
+def _glow_cache_put(cache, key, value, limit):
+    with _IMAGE_CACHE_LOCK:
+        if key in cache:
+            del cache[key]
+        cache[key] = value
+        # Drop the oldest entry only. Clearing the whole cache forced every
+        # later card (and the next QB rotation) to rebuild every halo.
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
 
 
 def _text_glow_layers(font, text, glow_color):
@@ -2090,8 +3181,7 @@ def _text_glow_layers(font, text, glow_color):
         bool(font.bold()),
         gc.rgba(),
     )
-    with _IMAGE_CACHE_LOCK:
-        cached = _GLOW_LAYER_CACHE.get(key)
+    cached = _glow_cache_get(_GLOW_LAYER_CACHE, key)
     if cached is not None:
         return cached
 
@@ -2126,15 +3216,19 @@ def _text_glow_layers(font, text, glow_color):
     bloom = _approx_blur_pixmap(bloom, strength=4)
     wide = _approx_blur_pixmap(bloom, strength=7)
     layers = (bloom, wide, ox, oy)
-    with _IMAGE_CACHE_LOCK:
-        if len(_GLOW_LAYER_CACHE) > 400:
-            _GLOW_LAYER_CACHE.clear()
-        _GLOW_LAYER_CACHE[key] = layers
+    _glow_cache_put(_GLOW_LAYER_CACHE, key, layers, 1600)
+    # One card used to blur every glyph without returning to the scroll
+    # thread. Yield so a cold halo cannot hold the clock for the whole card.
+    time.sleep(0)
     return layers
 
 
 def _draw_text_glow(painter, x, y, text, fill_color, glow_color):
     """Soft diffuse halo *behind* text, then crisp fill on top (no bold edge)."""
+    if not text or not str(text).strip():
+        painter.setPen(QtGui.QColor(fill_color))
+        painter.drawText(x, y, text)
+        return
     bloom, wide, ox, oy = _text_glow_layers(painter.font(), text, glow_color)
     bx = int(x - ox)
     by = int(y - oy)
@@ -2161,17 +3255,17 @@ def _make_white_silhouette(pixmap):
     return sil
 
 
-def _draw_logo_white_glow(painter, x, y, pixmap):
-    """Faint soft white bloom *behind* logo (scaled+blurred silhouette)."""
-    if pixmap is None or pixmap.isNull():
-        return
+def _logo_glow_layers(pixmap):
+    """Faint white bloom for this logo. Logos repeat on every card rebuild."""
+    key = (int(pixmap.cacheKey()), pixmap.width(), pixmap.height())
+    cached = _glow_cache_get(_LOGO_GLOW_CACHE, key)
+    if cached is not None:
+        return cached
     sil = _make_white_silhouette(pixmap)
     if sil is None:
-        painter.drawImage(x, y, pixmap)
-        return
+        return None
     w, h = pixmap.width(), pixmap.height()
     pad = _GLOW_BLOOM_PAD
-    # Slight enlarge so bloom peeks past edges without a heavy halo
     big_w = int(w * 1.22) + pad * 2
     big_h = int(h * 1.22) + pad * 2
     layer = _blank_image(big_w, big_h)
@@ -2186,13 +3280,30 @@ def _draw_logo_white_glow(painter, x, y, pixmap):
     lp.end()
     bloom = _approx_blur_pixmap(layer, strength=4)
     bloom = _approx_blur_pixmap(bloom, strength=3)
-    # Center bloom on logo
-    bx = x + (w - bloom.width()) // 2
-    by = y + (h - bloom.height()) // 2
-    painter.setOpacity(0.18)
-    painter.drawImage(bx, by, bloom)
-    painter.setOpacity(0.09)
     wider = _approx_blur_pixmap(bloom, strength=2)
+    layers = (bloom, wider)
+    _glow_cache_put(_LOGO_GLOW_CACHE, key, layers, 80)
+    time.sleep(0)
+    return layers
+
+
+def _draw_logo_white_glow(painter, x, y, pixmap):
+    """Faint soft white bloom *behind* logo (scaled+blurred silhouette)."""
+    if pixmap is None or pixmap.isNull():
+        return
+    layers = _logo_glow_layers(pixmap)
+    if not layers:
+        painter.drawImage(x, y, pixmap)
+        return
+    bloom, wider = layers
+    w, h = pixmap.width(), pixmap.height()
+    painter.setOpacity(0.18)
+    painter.drawImage(
+        x + (w - bloom.width()) // 2,
+        y + (h - bloom.height()) // 2,
+        bloom,
+    )
+    painter.setOpacity(0.09)
     painter.drawImage(
         x + (w - wider.width()) // 2,
         y + (h - wider.height()) // 2,
@@ -2237,20 +3348,35 @@ def _draw_timeout_bars(painter, score_x, score_w, y, remaining, bar_h, gap, mark
                 painter.fillRect(xx + mark_w - 1, yy, 1, bar_h, used)
 
 
+def _icon_glow_layers(pixmap):
+    key = (int(pixmap.cacheKey()), pixmap.width(), pixmap.height())
+    cached = _glow_cache_get(_ICON_GLOW_CACHE, key)
+    if cached is not None:
+        return cached
+    sil = _make_white_silhouette(pixmap)
+    if sil is None:
+        return None
+    w, h = pixmap.width(), pixmap.height()
+    bw = max(1, int(w * 1.28))
+    bh = max(1, int(h * 1.28))
+    big = sil.scaled(
+        bw, bh, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation,
+    )
+    bloom = _approx_blur_pixmap(big, strength=3)
+    _glow_cache_put(_ICON_GLOW_CACHE, key, bloom, 32)
+    time.sleep(0)
+    return bloom
+
+
 def _draw_icon_glow(painter, x, y, pixmap):
     """Soft white bloom behind small icons (possession football)."""
     if pixmap is None or pixmap.isNull():
         return
-    sil = _make_white_silhouette(pixmap)
-    if sil is None:
+    bloom = _icon_glow_layers(pixmap)
+    if bloom is None:
         painter.drawImage(x, y, pixmap)
         return
     w, h = pixmap.width(), pixmap.height()
-    big = sil.scaled(
-        max(1, int(w * 1.28)), max(1, int(h * 1.28)),
-        QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation,
-    )
-    bloom = _approx_blur_pixmap(big, strength=3)
     painter.setOpacity(0.16)
     painter.drawImage(
         x + (w - bloom.width()) // 2,
@@ -2264,6 +3390,8 @@ def _draw_icon_glow(painter, x, y, pixmap):
 def _game_visual_key(game, qb_rotate_index, settings):
     """Tuple of fields that affect card pixels (for skip-rebuild fingerprint)."""
     show_qb = settings.get("show_qb_stats", True)
+    show_lp = settings.get("show_last_play", True)
+    show_drive = settings.get("show_drive_summary", False)
     return (
         game.get("game_id"),
         game.get("state"),
@@ -2278,18 +3406,167 @@ def _game_visual_key(game, qb_rotate_index, settings):
         game.get("down_distance"),
         game.get("ball_on"),
         game.get("last_play"),
+        game.get("drive_summary"),
         game.get("status_detail"),
         game.get("kickoff"),
+        game.get("broadcast"),
+        game.get("spread"),
+        game.get("away_record"),
+        game.get("home_record"),
         game.get("possession_id"),
+        bool(game.get("is_red_zone")),
+        bool(game.get("is_fourth_down")),
         game.get("away_timeouts"),
         game.get("home_timeouts"),
+        bool(show_lp),
+        bool(show_drive),
         _pick_qb_line(game.get("away_qbs") or [], qb_rotate_index) if show_qb else "",
         _pick_qb_line(game.get("home_qbs") or [], qb_rotate_index) if show_qb else "",
     )
 
 
-def build_game_card(host, game, qb_rotate_index=0):
-    """Render one game to a QImage (logical coords, DPR-scaled)."""
+def _score_is_wide(value):
+    """True when a score needs more than the reserved two-digit column."""
+    return len(str(value or "").strip()) >= 3
+
+
+def _game_base_key(game, qb_rotate_index, settings):
+    """Pixels that do not change when the clock, down, play, score, or passer line ticks.
+
+    Live updates and passer rotation stamp this image instead of repainting
+    logos and names. qb_rotate_index is unused; the passer line is overlay.
+    """
+    state = game.get("state")
+    heading = _break_heading(game) if state in ("in", "post") else ""
+    return (
+        game.get("game_id"),
+        state,
+        game.get("away_id"),
+        game.get("home_id"),
+        game.get("away_name"),
+        game.get("home_name"),
+        game.get("away_abbr"),
+        game.get("home_abbr"),
+        tuple(game.get("away_lines") or ()),
+        tuple(game.get("home_lines") or ()),
+        heading,
+        game.get("kickoff"),
+        game.get("broadcast"),
+        game.get("spread"),
+        game.get("away_record"),
+        game.get("home_record"),
+        _score_is_wide(game.get("away_score")),
+        _score_is_wide(game.get("home_score")),
+        bool(settings.get("show_possession", True)),
+    )
+
+
+def _postgame_visual_key(game, side):
+    stats = game.get(f"{side}_post") or {}
+    team = game.get("away_name") if side == "away" else game.get("home_name")
+    return (
+        "post",
+        game.get("game_id"),
+        side,
+        tuple(tuple(s) for s in (stats.get("sections") or ())),
+        team,
+    )
+
+
+def _strip_card_jobs(games, qb_rotate_index, settings):
+    """Scroll order: each game card, then away/home post-game stats for finals."""
+    jobs = []
+    want_post = bool(settings.get("include_postgame_stats", False))
+    for g in games or []:
+        jobs.append((_game_visual_key(g, qb_rotate_index, settings), "game", g, None))
+        if not want_post or g.get("state") != "post":
+            continue
+        for side in ("away", "home"):
+            stats = g.get(f"{side}_post") or {}
+            if not (stats.get("sections") or []):
+                continue
+            jobs.append((_postgame_visual_key(g, side), "post", g, side))
+    return jobs
+
+
+def build_postgame_stats_card(host, game, side):
+    """One-line crawl: TEAM PASS / RUSH / REC / SACKS / TACKLE; headers in team color."""
+    settings = host.settings
+    h = host.ticker_height
+    dpr = host.dpr
+    stats = game.get(f"{side}_post") or {}
+    sections = stats.get("sections") or []
+    team_full = (
+        stats.get("team_full")
+        or (game.get("away_name") if side == "away" else game.get("home_name"))
+        or ""
+    )
+    team_color = QtGui.QColor(get_team_color(team_full, settings))
+    glow_names = bool(settings.get("glow_team_names", False))
+    glow_all = bool(settings.get("glow_all", False))
+
+    font = QtGui.QFont(
+        getattr(host, "postgame_font", None)
+        or getattr(host, "situation_font", None)
+        or getattr(host, "small_font_bold", host.small_font)
+    )
+    fm = QtGui.QFontMetrics(font)
+    body_color = QtGui.QColor("#FFFFFF")
+    gap = "  "
+    runs = []
+    for i, section in enumerate(sections):
+        if not section or len(section) < 2:
+            continue
+        header, body = section[0], section[1]
+        if i:
+            runs.append((gap, body_color, glow_all))
+        if header:
+            runs.append((f"{header}:", team_color, glow_names or glow_all))
+        if body:
+            runs.append((f" {body}", body_color, glow_all))
+
+    line_w = sum(fm.horizontalAdvance(text) for text, _c, _g in runs if text)
+    pad = 10
+    total_w = max(48, pad + line_w + pad)
+    image = QtGui.QImage(
+        max(1, int(total_w * dpr)),
+        max(1, int(h * dpr)),
+        QtGui.QImage.Format_ARGB32_Premultiplied,
+    )
+    image.setDevicePixelRatio(dpr)
+    image.fill(0)
+    painter = QtGui.QPainter(image)
+    painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+    painter.setFont(font)
+    cap = fm.capHeight()
+    if cap <= 0:
+        cap = -fm.tightBoundingRect("ABCDEFGHIJKLMNOPQRSTUVWXYZ").top()
+    if cap <= 0:
+        cap = fm.ascent()
+    y = int(round(h / 2.0 + cap / 2.0))
+    x = float(pad)
+    for text, color, do_glow in runs:
+        if not text:
+            continue
+        ix = int(round(x))
+        if do_glow:
+            _draw_text_glow(painter, ix, y, text, color, color)
+        else:
+            painter.setPen(color)
+            painter.drawText(ix, y, text)
+        x += fm.horizontalAdvance(text)
+    painter.end()
+    time.sleep(0)
+    return image
+
+
+def build_game_card(host, game, qb_rotate_index=0, layer="full", target=None):
+    """Render one game to a QImage (logical coords, DPR-scaled).
+
+    layer "full" paints everything. "base" skips the live overlay (scores,
+    timeouts, possession, clock / down / play) so that image can be cached.
+    "overlay" paints only that overlay onto target (a copy of the base).
+    """
     settings = host.settings
     h = host.ticker_height
     dpr = host.dpr
@@ -2320,13 +3597,16 @@ def build_game_card(host, game, qb_rotate_index=0):
 
     show_qb = settings.get("show_qb_stats", True)
     show_lp = settings.get("show_last_play", True)
+    show_drive = settings.get("show_drive_summary", False)
     show_ball = settings.get("show_ball_on", True)
     show_poss = settings.get("show_possession", True)
     glow_names = bool(settings.get("glow_team_names", False))
     glow_all = bool(settings.get("glow_all", False))
 
-    away_qb_segs = _pick_qb_segments(game.get("away_qbs") or [], qb_rotate_index) if show_qb else []
-    home_qb_segs = _pick_qb_segments(game.get("home_qbs") or [], qb_rotate_index) if show_qb else []
+    away_qb_list = game.get("away_qbs") or []
+    home_qb_list = game.get("home_qbs") or []
+    away_qb_segs = _pick_qb_segments(away_qb_list, qb_rotate_index) if show_qb else []
+    home_qb_segs = _pick_qb_segments(home_qb_list, qb_rotate_index) if show_qb else []
     away_qb = "".join(t for t, _ in away_qb_segs)
     home_qb = "".join(t for t, _ in home_qb_segs)
 
@@ -2337,18 +3617,52 @@ def build_game_card(host, game, qb_rotate_index=0):
     qb_faux = bool(getattr(host, "qb_faux_bold", False))
     away_qb_w = _qb_segments_width(away_qb_segs, bold_small, regular_small, qb_faux) if away_qb_segs else 0
     home_qb_w = _qb_segments_width(home_qb_segs, bold_small, regular_small, qb_faux) if home_qb_segs else 0
-    away_block = max(away_name_w, away_qb_w)
-    home_block = max(home_name_w, home_qb_w)
+    # Reserve the widest passer line so a rotation does not change card width
+    # or force a new base image.
+    away_qb_slot = away_qb_w
+    home_qb_slot = home_qb_w
+    if show_qb:
+        for _qi in range(max(len(away_qb_list), len(home_qb_list))):
+            if _qi < len(away_qb_list):
+                away_qb_slot = max(
+                    away_qb_slot,
+                    _qb_segments_width(
+                        _pick_qb_segments(away_qb_list, _qi),
+                        bold_small, regular_small, qb_faux,
+                    ),
+                )
+            if _qi < len(home_qb_list):
+                home_qb_slot = max(
+                    home_qb_slot,
+                    _qb_segments_width(
+                        _pick_qb_segments(home_qb_list, _qi),
+                        bold_small, regular_small, qb_faux,
+                    ),
+                )
+
+    state = game.get("state")
+    # Pregame records sit outside the names (away left of name, home right).
+    away_rec = (game.get("away_record") or "").strip() if state == "pre" else ""
+    home_rec = (game.get("home_record") or "").strip() if state == "pre" else ""
+    away_rec_gap = tiny_m.horizontalAdvance(" ") if away_rec else 0
+    home_rec_gap = tiny_m.horizontalAdvance(" ") if home_rec else 0
+    away_rec_w = tiny_m.horizontalAdvance(away_rec) if away_rec else 0
+    home_rec_w = tiny_m.horizontalAdvance(home_rec) if home_rec else 0
+    away_name_total = away_name_w + away_rec_gap + away_rec_w
+    home_name_total = home_name_w + home_rec_gap + home_rec_w
+    away_block = max(away_name_total, away_qb_slot)
+    home_block = max(home_name_total, home_qb_slot)
     sym = max(away_block, home_block)
     away_block = home_block = sym
 
-    state = game.get("state")
     status_detail = (game.get("status_detail") or "").strip()
+    # Center linescore for in-game quarter breaks and finals (periods only).
     break_heading = _break_heading(game) if state in ("in", "post") else ""
     linescore = None
     if break_heading:
         linescore = _prepare_linescore(
-            getattr(host, "situation_font", host.small_font),
+            getattr(host, "linescore_font", None)
+            or getattr(host, "main_font", host.small_font),
             game,
             h,
             heading=break_heading,
@@ -2359,34 +3673,65 @@ def build_game_card(host, game, qb_rotate_index=0):
     home_score = str(game.get("home_score") or "0") if show_scores else ""
     away_score_w = score_m.horizontalAdvance(away_score) if away_score else 0
     home_score_w = score_m.horizontalAdvance(home_score) if home_score else 0
+    # Reserve at least two score digits so 7→17 does not shift center / logos.
+    # Wider only when a score is already 3+ digits (rare) so it is not clipped.
+    _score_slot_min = score_m.horizontalAdvance("00") if show_scores else 0
+    away_score_col = max(away_score_w, _score_slot_min) if away_score else 0
+    home_score_col = max(home_score_w, _score_slot_min) if home_score else 0
 
     down = (game.get("down_distance") or "").strip()
     ball_on = (game.get("ball_on") or "").strip() if show_ball else ""
-    last_play = (game.get("last_play") or "").strip() if show_lp else ""
+    last_play_raw = (game.get("last_play") or "").strip()
+    drive_raw = (game.get("drive_summary") or "").strip()
+    if show_drive:
+        bottom_row = drive_raw or last_play_raw
+    elif show_lp:
+        bottom_row = last_play_raw
+    else:
+        bottom_row = ""
 
     # Pregame / final keep the short center. Live games stack clock, down, play.
     vs_m = QtGui.QFontMetrics(host.vs_font)
     sit_font = sit_m = play_font = play_m = None
+    pre_sub_font = pre_sub_m = None
     center_gap = 1
     center_items = []
     center_kind = "main"
     center_main = ""
-    center_sub = ""
+    center_subs = []
+    live_max_play_lines = 2
     if state == "pre":
         center_main = game.get("kickoff") or status_detail or "vs"
         center_kind = "time"
-        center_sub = "vs"
+        # Network / spread: clearly larger than small_font, under kickoff size.
+        pre_sub_font = QtGui.QFont(host.time_font)
+        _time_px = host.time_font.pixelSize()
+        if _time_px < 1:
+            _time_px = max(6, int(h * 0.16)) + 1
+        pre_sub_font.setPixelSize(max(8, _time_px - 2))
+        pre_sub_m = QtGui.QFontMetrics(pre_sub_font)
+        # Ideal row gap; shrink later if the stack will not fit the bar.
+        center_gap = 5
+        net = (game.get("broadcast") or "").strip()
+        spr = (game.get("spread") or "").strip()
+        if net:
+            center_subs.append(net)
+        if spr:
+            center_subs.append(spr)
+        if not center_subs:
+            center_subs.append("vs")
     elif linescore:
         center_main_w = linescore["width"]
     elif state == "post":
-        center_main = "F"
-        center_sub = status_detail if status_detail.lower() != "final" else ""
+        # Final with no ESPN linescores: narrow gap between scores only.
+        center_main_w = max(12, int(h * 0.18))
+        center_items = []
     else:
-        # LED time face has no readable lowercase ( "1st" draws as "1SC" ).
+        # LED Ozone face has no readable lowercase ( "1st" draws as "1SC" ).
         clock_text = status_detail.upper()
-        situation_line = _live_situation_line(down, ball_on)
-        play_text = last_play.upper()
-        play_wrap_w = max(220, int(h * 3.8))
+        situation_line = _live_situation_line(down, ball_on).upper()
+        play_text = bottom_row.upper()
+        # Down line: same Ozone LED face as team names / scores / quarter table.
         sit_font = QtGui.QFont(host.situation_font)
         play_font = QtGui.QFont(host.play_font)
         sit_px = sit_font.pixelSize()
@@ -2394,16 +3739,29 @@ def build_game_card(host, game, qb_rotate_index=0):
         if sit_px < 1:
             sit_px = max(10, int(h * 0.20))
         if play_px < 1:
-            play_px = max(6, int(h * 0.145) - 2)
+            play_px = max(8, min(14, int(h * 0.14)))
+        sit_px0, play_px0 = sit_px, play_px
+        # Stable live center: clock + fixed max-down samples only.
+        # Play wraps inside this column; it must not widen the card.
+        sit_font.setPixelSize(sit_px0)
+        sit_m = QtGui.QFontMetrics(sit_font)
+        _clock_budget = time_m.horizontalAdvance("12:00 - 2ND")
+        _down_budget = sit_m.horizontalAdvance("1ST & GOAL ON WSH 49")
+        center_main_w = max(int(_clock_budget), int(_down_budget), 48)
+        max_play_lines = 3
         lp_lines = []
         while True:
             sit_font.setPixelSize(sit_px)
             play_font.setPixelSize(play_px)
             sit_m = QtGui.QFontMetrics(sit_font)
             play_m = QtGui.QFontMetrics(play_font)
-            lp_lines = _fit_lines(play_text, play_m, play_wrap_w, 2) if play_text else []
+            lp_lines = (
+                _fit_lines(play_text, play_m, center_main_w, max_play_lines)
+                if play_text else []
+            )
             plan = _live_center_rows(
                 h, time_m, sit_m, play_m, clock_text, situation_line, lp_lines,
+                max_play_lines=max_play_lines,
             )
             if plan["reserved"] <= h:
                 break
@@ -2415,15 +3773,13 @@ def build_game_card(host, game, qb_rotate_index=0):
                 sit_px -= 1
                 shrunk = True
             if not shrunk:
+                if max_play_lines > 2:
+                    # Shrink play glyphs before giving up a wrap line.
+                    max_play_lines = 2
+                    sit_px, play_px = sit_px0, play_px0
+                    continue
                 break
-        center_main_w = 40
-        if clock_text:
-            center_main_w = max(center_main_w, time_m.horizontalAdvance(clock_text))
-        if situation_line:
-            center_main_w = max(center_main_w, sit_m.horizontalAdvance(situation_line))
-        for ln in lp_lines:
-            center_main_w = max(center_main_w, play_m.horizontalAdvance(ln))
-        center_main_w = max(int(center_main_w), 48)
+        live_max_play_lines = max_play_lines
         center_gap = 1
         if clock_text:
             center_items.append(("time", clock_text))
@@ -2432,18 +3788,42 @@ def build_game_card(host, game, qb_rotate_index=0):
         for ln in lp_lines:
             center_items.append(("play", ln))
 
-    if state != "in" and not linescore:
+    if state == "pre":
         _center_fm = time_m if center_kind == "time" else vs_m
         center_main_w = max(
             _center_fm.horizontalAdvance(center_main) if center_main else 0,
-            small_m.horizontalAdvance(center_sub) if center_sub else 0,
+            40,
+        )
+        for sub in center_subs:
+            center_main_w = max(center_main_w, pre_sub_m.horizontalAdvance(sub))
+        center_main_w = max(center_main_w, 48)
+        if center_main:
+            center_items.append((center_kind, center_main))
+        for sub in center_subs:
+            center_items.append(("sub", sub))
+        # Fit kickoff / network / spread in the bar with clear gaps + edge room.
+        _pre_heights = []
+        if center_main:
+            _pre_heights.append(_glyph_line(time_m, center_main)[0])
+        for sub in center_subs:
+            _pre_heights.append(_glyph_line(pre_sub_m, sub)[0])
+        _n_pre = len(_pre_heights)
+        if _n_pre > 1:
+            _edge = 2
+            _content = sum(_pre_heights)
+            _avail = h - 2 * _edge
+            _need = _content + center_gap * (_n_pre - 1)
+            if _need > _avail:
+                center_gap = max(2, (_avail - _content) // (_n_pre - 1))
+    elif state != "in" and state != "post" and not linescore:
+        _center_fm = time_m if center_kind == "time" else vs_m
+        center_main_w = max(
+            _center_fm.horizontalAdvance(center_main) if center_main else 0,
             40,
         )
         center_main_w = max(center_main_w, 48)
         if center_main:
             center_items.append((center_kind, center_main))
-        if center_sub:
-            center_items.append(("sub", center_sub))
 
     pad = 8
     # Same ink-to-ink gap: name ↔ logo ↔ score (logos have uneven canvas pad).
@@ -2454,22 +3834,26 @@ def build_game_card(host, game, qb_rotate_index=0):
     poss_icon = None
     away_has_ball = False
     home_has_ball = False
-    if show_poss and state == "in" and game.get("possession_id"):
-        poss_id = str(game.get("possession_id"))
+    # Always reserve both icon slots on a live card so a possession flip
+    # does not change the width or force a full rebuild.
+    reserve_poss = bool(show_poss and state == "in")
+    if reserve_poss:
         poss_icon = get_football_icon(max(12, int(h * 0.26)))
-        away_has_ball = poss_id == str(game.get("away_id"))
-        home_has_ball = poss_id == str(game.get("home_id"))
+        poss_id = str(game.get("possession_id") or "")
+        away_has_ball = bool(poss_id) and poss_id == str(game.get("away_id"))
+        home_has_ball = bool(poss_id) and poss_id == str(game.get("home_id"))
     poss_icon_w = poss_icon.width() if poss_icon is not None else 0
-    away_inside = (poss_pad + poss_icon_w) if away_has_ball else 0
-    home_inside = (poss_pad + poss_icon_w) if home_has_ball else 0
+    poss_slot = (poss_pad + poss_icon_w) if reserve_poss else 0
+    away_inside = poss_slot
+    home_inside = poss_slot
     # Pregame: no score digits — logo sits closer to kickoff/vs center
     gap_logo_center = gap_logo_score if not show_scores else gap_logo_score
 
     if show_scores:
         total_w = (
             pad + away_block + gap_name_logo + away_vis_w + gap_logo_score
-            + away_score_w + away_inside + gap_score_center + center_main_w
-            + gap_score_center + home_inside + home_score_w + gap_logo_score
+            + away_score_col + away_inside + gap_score_center + center_main_w
+            + gap_score_center + home_inside + home_score_col + gap_logo_score
             + home_vis_w + gap_name_logo + home_block + pad
         )
     else:
@@ -2483,12 +3867,27 @@ def build_game_card(host, game, qb_rotate_index=0):
 
     phys_w = max(1, int(total_w * dpr))
     phys_h = max(1, int(h * dpr))
-    image = QtGui.QImage(phys_w, phys_h, QtGui.QImage.Format_ARGB32_Premultiplied)
-    image.setDevicePixelRatio(dpr)
-    image.fill(0)
+    if target is not None:
+        image = target
+    else:
+        image = QtGui.QImage(phys_w, phys_h, QtGui.QImage.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(dpr)
+        image.fill(0)
     painter = QtGui.QPainter(image)
     # Logical coords via devicePixelRatio (no painter.scale — avoids double-DPR)
     painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+
+    def _clear_slot(rx, rw):
+        """Drop previous overlay pixels in a reserved column (full bar height)."""
+        if layer != "overlay" or rw <= 0:
+            return
+        painter.save()
+        painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
+        painter.fillRect(QtCore.QRectF(rx, 0, rw, h), QtCore.Qt.transparent)
+        painter.restore()
+
+    paint_static = layer != "overlay"
+    paint_live = layer != "base"
 
     # Vertical layout — name optically centered on *drawn* logo; QB hangs below.
     # KeepAspectRatio logos are often shorter than logo_size (e.g. 79→59): name Y
@@ -2519,17 +3918,26 @@ def build_game_card(host, game, qb_rotate_index=0):
         )
 
     x = pad
-    # Away name (right-justified in block)
+    # Away name (right-justified in block); pregame record OUTSIDE left of name.
     painter.setFont(host.main_font)
-    _nx = x + away_block - away_name_w
-    if glow_names or glow_all:
+    _nx = x + away_block - away_name_total
+    if paint_static and away_rec:
+        painter.setFont(host.tiny_font)
+        if glow_all:
+            _draw_text_glow(painter, _nx, name_y, away_rec, "#BDBDBD", "#FFFFFF")
+        else:
+            painter.setPen(QtGui.QColor("#BDBDBD"))
+            painter.drawText(_nx, name_y, away_rec)
+        _nx = _nx + away_rec_w + away_rec_gap
+        painter.setFont(host.main_font)
+    if paint_static and (glow_names or glow_all):
         # Team-color glow when name glow on; faint white under glow_all alone
         _gc = away_color if glow_names else QtGui.QColor(255, 255, 255)
         _draw_text_glow(painter, _nx, name_y, away_label, away_color, _gc)
-    else:
+    elif paint_static:
         painter.setPen(away_color)
         painter.drawText(_nx, name_y, away_label)
-    if qb_y is not None and away_qb_segs:
+    if layer != "base" and qb_y is not None and away_qb_segs:
         _qx = x + away_block - away_qb_w
         _draw_mixed_text(
             painter, _qx, qb_y, away_qb_segs, bold_small, regular_small,
@@ -2537,13 +3945,11 @@ def build_game_card(host, game, qb_rotate_index=0):
         )
     x += away_block + gap_name_logo - _text_right_slack(metrics, away_label, away_name_w)
     away_logo_x = x - away_lpad
-    if glow_all:
+    if paint_static and glow_all:
         _draw_logo_white_glow(painter, away_logo_x, away_logo_y, away_logo)
-    else:
+    elif paint_static:
         painter.drawImage(away_logo_x, away_logo_y, away_logo)
     x += away_vis_w + (gap_logo_score if show_scores else gap_logo_center)
-    if show_scores:
-        x -= _text_left_slack(score_m, away_score)
 
     # Away score (live / final only — blank for pregame).
     # Same optical center as the team name, on the larger score face.
@@ -2580,31 +3986,42 @@ def build_game_card(host, game, qb_rotate_index=0):
 
     away_score_x = x
     if show_scores:
-        painter.setFont(score_font)
-        if glow_all:
-            _draw_text_glow(painter, x, score_y, away_score, "#FFFFFF", "#FFFFFF")
-        else:
-            painter.setPen(QtGui.QColor("#FFFFFF"))
-            painter.drawText(x, score_y, away_score)
-        _paint_timeouts(away_score_x, away_score_w, game.get("away_timeouts"), away_color)
-        x += away_score_w
-        if away_has_ball:
+        if paint_live:
+            _clear_slot(x, away_score_col)
+            painter.setFont(score_font)
+            score_draw_x = x + max(0, (away_score_col - away_score_w) // 2)
+            if glow_all:
+                _draw_text_glow(painter, score_draw_x, score_y, away_score, "#FFFFFF", "#FFFFFF")
+            else:
+                painter.setPen(QtGui.QColor("#FFFFFF"))
+                painter.drawText(score_draw_x, score_y, away_score)
+            # Timeouts centered on the reserved two-digit score column.
+            _paint_timeouts(away_score_x, away_score_col, game.get("away_timeouts"), away_color)
+        x += away_score_col
+        if reserve_poss:
             x += poss_pad
-            _paint_poss(x)
+            _clear_slot(x, poss_icon_w)
+            if paint_live and away_has_ball:
+                _paint_poss(x)
             x += poss_icon_w
         x += gap_score_center
     else:
         away_score_x = x  # center starts immediately after logo gap
 
-    # Center column — live: clock / down@spot / play, all between the scores.
+    # Center column — live: clock / down on spot / play, all between the scores.
     center_left = x
     center_w = center_main_w
+    # Live clock/down/play is the overlay. Linescore and pregame stay on the base.
+    live_center = state == "in" and not linescore
+    if live_center:
+        _clear_slot(center_left, center_w)
+    draw_center = paint_live if live_center else paint_static
 
-    if linescore:
+    if draw_center and linescore:
         _draw_linescore(
             painter, center_left, center_w, h, linescore, away_color, home_color,
         )
-    elif center_items:
+    elif draw_center and center_items:
         live_clock = state == "in" and any(k == "time" for k, _ in center_items)
         live_rows = None
         if live_clock:
@@ -2613,6 +4030,7 @@ def build_game_card(host, game, qb_rotate_index=0):
             play_lines = [t for k, t in center_items if k == "play"]
             live_rows = _live_center_rows(
                 h, time_m, sit_m, play_m, clock_text, sit_text, play_lines,
+                max_play_lines=live_max_play_lines,
             )
         else:
             item_metrics = []
@@ -2620,7 +4038,7 @@ def build_game_card(host, game, qb_rotate_index=0):
                 if kind == "main":
                     fm = vs_m
                 elif kind == "sub":
-                    fm = small_m
+                    fm = pre_sub_m if pre_sub_m is not None else small_m
                 elif kind == "time":
                     fm = time_m
                 else:
@@ -2650,13 +4068,17 @@ def build_game_card(host, game, qb_rotate_index=0):
                 fm = vs_m
                 fill = "#FFD700" if state == "post" else "#FFFFFF"
             elif kind == "sub":
-                painter.setFont(host.small_font)
-                fm = small_m
+                if pre_sub_font is not None:
+                    painter.setFont(pre_sub_font)
+                    fm = pre_sub_m
+                else:
+                    painter.setFont(host.small_font)
+                    fm = small_m
                 fill = "#A0A0A0"
             elif kind == "sit":
                 painter.setFont(sit_font)
                 fm = sit_m
-                fill = "#00BFFF" if clock_blue else "#FFFFFF"
+                fill = _sit_word_color(game, clock_blue, settings)
             else:
                 painter.setFont(play_font)
                 fm = play_m
@@ -2667,7 +4089,8 @@ def build_game_card(host, game, qb_rotate_index=0):
                 elif kind == "sit":
                     top, vis_ascent = live_rows["sit"]
                 else:
-                    slot = "play" if play_i == 0 else "play2"
+                    _play_slots = ("play", "play2", "play3")
+                    slot = _play_slots[min(play_i, len(_play_slots) - 1)]
                     play_i += 1
                     top, vis_ascent = live_rows[slot]
                 ty = top + vis_ascent
@@ -2677,6 +4100,14 @@ def build_game_card(host, game, qb_rotate_index=0):
                 cy += vis_h + center_gap
             tw = fm.horizontalAdvance(text)
             tx = center_left + (center_w - tw) // 2
+            # Pixel Font7 smears under TextAntialiasing; disable for play
+            # lines only, then restore whatever the card painter had set.
+            _play_aa_prev = None
+            if kind == "play":
+                _play_aa_prev = painter.testRenderHint(
+                    QtGui.QPainter.TextAntialiasing
+                )
+                painter.setRenderHint(QtGui.QPainter.TextAntialiasing, False)
             if kind == "time" and clock_blue:
                 left, dash, right = _split_clock_line(text)
                 if dash:
@@ -2717,47 +4148,63 @@ def build_game_card(host, game, qb_rotate_index=0):
             else:
                 painter.setPen(QtGui.QColor(fill))
                 painter.drawText(tx, ty, text)
+            if _play_aa_prev is not None:
+                painter.setRenderHint(
+                    QtGui.QPainter.TextAntialiasing, _play_aa_prev
+                )
 
     x += center_w
-    if show_scores and home_has_ball:
+    if show_scores:
         x += gap_score_center
-        _paint_poss(x)
-        x += poss_icon_w + poss_pad
+        if reserve_poss:
+            _clear_slot(x, poss_icon_w)
+            if paint_live and home_has_ball:
+                _paint_poss(x)
+            x += poss_icon_w + poss_pad
     else:
-        x += gap_score_center if show_scores else gap_logo_center
+        x += gap_logo_center
 
     # Home score (live / final only)
     home_score_x = x
     if show_scores:
-        painter.setFont(score_font)
-        if glow_all:
-            _draw_text_glow(painter, x, score_y, home_score, "#FFFFFF", "#FFFFFF")
-        else:
-            painter.setPen(QtGui.QColor("#FFFFFF"))
-            painter.drawText(x, score_y, home_score)
-        _paint_timeouts(home_score_x, home_score_w, game.get("home_timeouts"), home_color)
+        if paint_live:
+            _clear_slot(x, home_score_col)
+            painter.setFont(score_font)
+            score_draw_x = x + max(0, (home_score_col - home_score_w) // 2)
+            if glow_all:
+                _draw_text_glow(painter, score_draw_x, score_y, home_score, "#FFFFFF", "#FFFFFF")
+            else:
+                painter.setPen(QtGui.QColor("#FFFFFF"))
+                painter.drawText(score_draw_x, score_y, home_score)
+            _paint_timeouts(home_score_x, home_score_col, game.get("home_timeouts"), home_color)
 
-        x += home_score_w + gap_logo_score - _text_right_slack(
-            score_m, home_score, home_score_w,
-        )
+        x += home_score_col + gap_logo_score
     else:
         x += 0  # already advanced logo-center gap above
 
     home_logo_x = x - home_lpad
-    if glow_all:
+    if paint_static and glow_all:
         _draw_logo_white_glow(painter, home_logo_x, home_logo_y, home_logo)
-    else:
+    elif paint_static:
         painter.drawImage(home_logo_x, home_logo_y, home_logo)
     x += home_vis_w + gap_name_logo - _text_left_slack(metrics, home_label)
 
     painter.setFont(host.main_font)
-    if glow_names or glow_all:
+    if paint_static and (glow_names or glow_all):
         _gc = home_color if glow_names else QtGui.QColor(255, 255, 255)
         _draw_text_glow(painter, x, name_y, home_label, home_color, _gc)
-    else:
+    elif paint_static:
         painter.setPen(home_color)
         painter.drawText(x, name_y, home_label)
-    if qb_y is not None and home_qb_segs:
+    if paint_static and home_rec:
+        painter.setFont(host.tiny_font)
+        rx = x + home_name_w + home_rec_gap
+        if glow_all:
+            _draw_text_glow(painter, rx, name_y, home_rec, "#BDBDBD", "#FFFFFF")
+        else:
+            painter.setPen(QtGui.QColor("#BDBDBD"))
+            painter.drawText(rx, name_y, home_rec)
+    if layer != "base" and qb_y is not None and home_qb_segs:
         _draw_mixed_text(
             painter, x, qb_y, home_qb_segs, bold_small, regular_small,
             "#BDBDBD", glow=glow_all, glow_color="#FFFFFF", faux_bold=qb_faux,
@@ -2767,11 +4214,19 @@ def build_game_card(host, game, qb_rotate_index=0):
     return image
 
 
+def stamp_live_card(base, host, game, qb_rotate_index=0):
+    """Copy the cached base and paint only the live overlay onto it."""
+    img = base.copy()
+    return build_game_card(
+        host, game, qb_rotate_index, layer="overlay", target=img,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Settings dialog
 # ---------------------------------------------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
-    """Settings dialog with General + Team Colors tabs (MLB-TCKR pattern)."""
+    """Settings dialog with General, Team Colors, and Network tabs."""
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -2785,6 +4240,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._create_general_tab(), "General")
         self.tabs.addTab(self._create_team_colors_tab(), "Team Colors")
+        self.tabs.addTab(self._create_network_tab(), "Network")
         root.addWidget(self.tabs)
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -2864,6 +4320,11 @@ class SettingsDialog(QtWidgets.QDialog):
         _ctr_row.addWidget(self._content_tr_label)
         layout.addRow("Content transparency:", _ctr_row)
 
+        self.font_combo = QtWidgets.QComboBox()
+        _fill_font_combo(self.font_combo, _ticker_font_request(settings))
+        self.font_combo.setToolTip("Team names, scores, and clock. Bundled fonts/ faces.")
+        layout.addRow("Ticker font:", self.font_combo)
+
         self.name_mode = QtWidgets.QComboBox()
         self.name_mode.addItem("Team Name (e.g. Giants)", "nickname")
         self.name_mode.addItem("City + Team (e.g. New York Giants)", "city")
@@ -2880,8 +4341,30 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addRow("Team name display:", self.name_mode)
 
         self.show_lp = QtWidgets.QCheckBox("Show last play")
-        self.show_lp.setChecked(settings.get("show_last_play", True))
+        self.show_lp.setChecked(
+            settings.get("show_last_play", True)
+            and not settings.get("show_drive_summary", False)
+        )
+        self.show_lp.setToolTip("Bottom center row: the most recent play text")
         layout.addRow(self.show_lp)
+
+        self.show_drive = QtWidgets.QCheckBox("Show drive summary")
+        self.show_drive.setChecked(settings.get("show_drive_summary", False))
+        self.show_drive.setToolTip("Bottom center row: current drive plays and yards")
+        layout.addRow(self.show_drive)
+
+        def _bottom_row_exclusive(checked, other):
+            if checked and other.isChecked():
+                other.blockSignals(True)
+                other.setChecked(False)
+                other.blockSignals(False)
+
+        self.show_lp.toggled.connect(
+            lambda checked: _bottom_row_exclusive(checked, self.show_drive)
+        )
+        self.show_drive.toggled.connect(
+            lambda checked: _bottom_row_exclusive(checked, self.show_lp)
+        )
 
         self.show_qb = QtWidgets.QCheckBox("Show QB stats")
         self.show_qb.setChecked(settings.get("show_qb_stats", True))
@@ -2910,6 +4393,22 @@ class SettingsDialog(QtWidgets.QDialog):
         self.finals = QtWidgets.QCheckBox("Include final games")
         self.finals.setChecked(settings.get("include_final_games", True))
         layout.addRow(self.finals)
+
+        self.postgame = QtWidgets.QCheckBox("Include Post-Game Stats")
+        self.postgame.setChecked(settings.get("include_postgame_stats", False))
+        self.postgame.setToolTip(
+            "After each final score, scroll away then home PASS/RUSH/REC/SACKS/TACKLE leaders"
+        )
+        layout.addRow(self.postgame)
+
+        self.postgame_font_combo = QtWidgets.QComboBox()
+        _fill_font_combo(self.postgame_font_combo, _postgame_font_request(settings))
+        self.postgame_font_combo.setToolTip(
+            "Typeface for the post-game PASS/RUSH/REC line. Size stays 2× the down line."
+        )
+        self.postgame_font_combo.setEnabled(self.postgame.isChecked())
+        self.postgame.toggled.connect(self.postgame_font_combo.setEnabled)
+        layout.addRow("Post-game stats font:", self.postgame_font_combo)
 
         self.scheduled = QtWidgets.QCheckBox("Include scheduled games")
         self.scheduled.setChecked(settings.get("include_scheduled_games", True))
@@ -3107,11 +4606,80 @@ class SettingsDialog(QtWidgets.QDialog):
             widgets["color"] = primary
             widgets["input"].setText(primary)
 
+    def _create_network_tab(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setAlignment(QtCore.Qt.AlignTop)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(14)
+
+        intro = QtWidgets.QLabel(
+            "Proxy and certificate settings for ESPN fetches. Applied when you "
+            "click OK. Enable a proxy for corporate networks; optionally pick a "
+            ".pem/.crt if SSL inspection uses a private CA."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        proxy_group = QtWidgets.QGroupBox("Proxy")
+        proxy_form = QtWidgets.QFormLayout(proxy_group)
+        proxy_form.setContentsMargins(10, 12, 10, 10)
+        proxy_form.setSpacing(8)
+
+        self.use_proxy_check = QtWidgets.QCheckBox("Enable Proxy")
+        self.use_proxy_check.setChecked(bool(self.settings.get("use_proxy", False)))
+        proxy_form.addRow(self.use_proxy_check)
+
+        self.proxy_url_edit = QtWidgets.QLineEdit(
+            normalize_proxy_url(self.settings.get("proxy", ""))
+        )
+        self.proxy_url_edit.setPlaceholderText("http://proxy.example.com:8080")
+        self.proxy_url_edit.setEnabled(self.use_proxy_check.isChecked())
+        self.use_proxy_check.toggled.connect(self.proxy_url_edit.setEnabled)
+        proxy_form.addRow("Proxy URL:", self.proxy_url_edit)
+        layout.addWidget(proxy_group)
+
+        cert_group = QtWidgets.QGroupBox("SSL Certificate (Optional)")
+        cert_form = QtWidgets.QFormLayout(cert_group)
+        cert_form.setContentsMargins(10, 12, 10, 10)
+        cert_form.setSpacing(8)
+
+        self.use_cert_check = QtWidgets.QCheckBox("Use Certificate File")
+        self.use_cert_check.setChecked(bool(self.settings.get("use_cert", False)))
+        cert_form.addRow(self.use_cert_check)
+
+        cert_row = QtWidgets.QHBoxLayout()
+        self.cert_file_edit = QtWidgets.QLineEdit(self.settings.get("cert_file", "") or "")
+        self.cert_file_edit.setPlaceholderText("Path to .pem / .crt certificate file")
+        self.cert_file_edit.setEnabled(self.use_cert_check.isChecked())
+        self.use_cert_check.toggled.connect(self.cert_file_edit.setEnabled)
+        browse_btn = QtWidgets.QPushButton("Browse…")
+        browse_btn.setEnabled(self.use_cert_check.isChecked())
+        self.use_cert_check.toggled.connect(browse_btn.setEnabled)
+        browse_btn.clicked.connect(self.browse_cert_file)
+        cert_row.addWidget(self.cert_file_edit)
+        cert_row.addWidget(browse_btn)
+        cert_form.addRow("Certificate File:", cert_row)
+        layout.addWidget(cert_group)
+        layout.addStretch()
+        return widget
+
+    def browse_cert_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Certificate File",
+            "",
+            "Certificate Files (*.pem *.crt *.cer *.ca-bundle);;All Files (*)",
+        )
+        if path:
+            self.cert_file_edit.setText(path)
+
     def apply(self):
         s = self.settings
         s["speed"] = self.speed.value()
         s["update_interval"] = self.update_iv.value()
         s["ticker_height"] = self.height.value()
+        s["font"] = self.font_combo.currentText().strip() or "Ozone"
         s["docked"] = self.docked.isChecked()
         # Invert UI transparency % → stored alpha (0=clear, 255=opaque)
         s["background_opacity"] = int(
@@ -3125,14 +4693,23 @@ class SettingsDialog(QtWidgets.QDialog):
         s["show_city_only"] = mode == "city_only"
         s["use_city_abbreviations"] = mode == "abbrev"
         s["show_last_play"] = self.show_lp.isChecked()
+        s["show_drive_summary"] = self.show_drive.isChecked()
         s["show_qb_stats"] = self.show_qb.isChecked()
         s["show_ball_on"] = self.show_ball.isChecked()
         s["show_possession"] = self.show_poss.isChecked()
         s["glow_team_names"] = self.glow_names.isChecked()
         s["glow_all"] = self.glow_all.isChecked()
         s["include_final_games"] = self.finals.isChecked()
+        s["include_postgame_stats"] = self.postgame.isChecked()
+        s["postgame_font"] = (
+            self.postgame_font_combo.currentText().strip() or "Gotham Black"
+        )
         s["include_scheduled_games"] = self.scheduled.isChecked()
         s["live_games_only"] = self.live_only.isChecked()
+        s["use_proxy"] = self.use_proxy_check.isChecked()
+        s["proxy"] = self.proxy_url_edit.text().strip()
+        s["use_cert"] = self.use_cert_check.isChecked()
+        s["cert_file"] = self.cert_file_edit.text().strip()
 
         # MLB pattern: store slot int for Secondary/Tertiary, hex for Custom;
         # omit Primary (default).
@@ -3160,6 +4737,7 @@ def _layout_tuple(settings, height, dpr):
         s.get("player_info_font", "Gotham Black"),
         bool(s.get("show_qb_stats", True)),
         bool(s.get("show_last_play", True)),
+        bool(s.get("show_drive_summary", False)),
         bool(s.get("show_ball_on", True)),
         bool(s.get("show_possession", True)),
         bool(s.get("glow_team_names", False)),
@@ -3167,6 +4745,8 @@ def _layout_tuple(settings, height, dpr):
         bool(s.get("use_city_abbreviations", False)),
         bool(s.get("show_city_only", False)),
         bool(s.get("show_team_cities", False)),
+        bool(s.get("include_postgame_stats", False)),
+        s.get("postgame_font", "Gotham Black"),
         round(float(dpr), 3),
     )
 
@@ -3175,8 +4755,9 @@ def _slate_fp(settings, games, qb_index, height, dpr):
     layout = _layout_tuple(settings, height, dpr)
     if not games:
         return ("empty", layout)
+    jobs = _strip_card_jobs(games, qb_index, settings)
     return (
-        tuple(_game_visual_key(g, qb_index, settings) for g in games),
+        tuple(job[0] for job in jobs),
         layout,
     )
 
@@ -3240,7 +4821,7 @@ def _compose_strip_image(card_images, settings, height, dpr):
 
 
 def _render_strip(host, games):
-    """Paint every card and the strip. Safe off the GUI thread (QImage only)."""
+    """Paint every card and compose the strip (GUI thread; loading / empty only)."""
     cards = []
     if not games:
         img = _blank_image(int(320 * host.dpr), int(host.ticker_height * host.dpr))
@@ -3252,18 +4833,21 @@ def _render_strip(host, games):
         p.end()
         cards = [img]
     else:
-        for g in games:
+        for _key, kind, game, side in _strip_card_jobs(
+            games, host.qb_rotate_index, host.settings
+        ):
             try:
-                cards.append(build_game_card(host, g, host.qb_rotate_index))
+                if kind == "post":
+                    cards.append(build_postgame_stats_card(host, game, side))
+                else:
+                    cards.append(build_game_card(host, game, host.qb_rotate_index))
             except Exception as e:
-                print(f"[CARD] {g.get('game_id')}: {e}")
+                print(f"[CARD] {game.get('game_id')}: {e}")
     return _compose_strip_image(cards, host.settings, host.ticker_height, host.dpr)
 
 
 class _SlateThread(QtCore.QThread):
-    """Network fetch only. Painting stays on the UI thread — QPainter on a
-    second thread stalls the scroll clock even when the paint itself is fast.
-    """
+    """Network fetch only. Never paint here — QPainter / scaled / blur stay on GUI."""
 
     result_ready = QtCore.pyqtSignal(object)
 
@@ -3278,12 +4862,12 @@ class _SlateThread(QtCore.QThread):
 
 
 class _FontHost:
-    """Font snapshot so cards can be painted on a QThread."""
+    """Font/settings snapshot for one sliced GUI-thread card rebuild."""
 
     _FONT_ATTRS = (
         "main_font", "score_font", "small_font", "small_font_bold",
         "small_font_regular", "tiny_font", "vs_font", "time_font",
-        "situation_font", "play_font",
+        "situation_font", "play_font", "linescore_font", "postgame_font",
     )
 
     def __init__(self, ticker):
@@ -3302,35 +4886,6 @@ class _FontHost:
             if px > 0:
                 font.setPixelSize(px)
             setattr(self, name, font)
-
-
-class _CardBuildThread(QtCore.QThread):
-    """Paint changed cards onto QImages. The scroll blit stays on the UI thread."""
-
-    cards_ready = QtCore.pyqtSignal(object)
-
-    def __init__(self, host, jobs, gen, fp):
-        super().__init__()
-        self._host = host
-        self._jobs = jobs
-        self._gen = gen
-        self._fp = fp
-
-    def run(self):
-        images = {}
-        for key, game in self._jobs:
-            try:
-                img = build_game_card(self._host, game, self._host.qb_rotate_index)
-                if img is not None and not img.isNull():
-                    images[key] = img.copy()
-            except Exception as e:
-                print(f"[CARD] {game.get('game_id')}: {e}")
-            time.sleep(0)
-        self.cards_ready.emit({
-            "gen": self._gen,
-            "fp": self._fp,
-            "images": images,
-        })
 
 
 # ---------------------------------------------------------------------------
@@ -3365,13 +4920,17 @@ class NFLTicker(QtWidgets.QWidget):
         self._build_gen = 0
         self._build_fp = None
         self._build_i = 0
-        self._build_cards = []
+        self._build_jobs = []
+        self._build_order = []
+        self._build_cards = []  # prior strip images by order index (partial swap)
         self._build_cache = {}
+        self._build_host = None
         self._scroll_speed_px_per_ms = 0.0
         self._scroll_step_px = 0.0  # fixed px per timer tick (stable dx)
         self._last_frame_ms = 0.0
         self._slate_fp = None  # last composed visual fingerprint
         self._card_cache = {}
+        self._card_base_cache = {}
         self._card_cache_layout = None
         self.cached_background = None
         self._cached_bg_key = None
@@ -3386,6 +4945,7 @@ class NFLTicker(QtWidgets.QWidget):
         self._sister_gone_streak = 0
         self._force_shell_appbar = False
         self._appbar_init_done = False
+        self._parking_appbar_window = False
         self._ticker_hidden_for_fullscreen = False
         self._fullscreen_override_exes = {
             x.lower() for x in self.settings.get("fullscreen_override_exes", [])
@@ -3492,7 +5052,8 @@ class NFLTicker(QtWidgets.QWidget):
 
         self.update_timer = QtCore.QTimer(self)
         self.update_timer.timeout.connect(self.refresh_games)
-        self.update_timer.start(int(self.settings.get("update_interval", 15)) * 1000)
+        if not _cli_test:
+            self.update_timer.start(int(self.settings.get("update_interval", 15)) * 1000)
 
         self.qb_timer = QtCore.QTimer(self)
         self.qb_timer.timeout.connect(self._rotate_qb)
@@ -3507,13 +5068,23 @@ class NFLTicker(QtWidgets.QWidget):
         else:
             print("[NFL-TCKR] --faststart: skipping title hold")
 
-        self.refresh_games()
+        if _cli_test:
+            self._test_tick = 0
+            self.games = build_test_games()
+            self._detect_scoring_alerts(self.games)
+            self._publish_strip()
+            print(f"[NFL-TCKR] {len(self.games)} test game(s) loaded")
+            self._test_timer = QtCore.QTimer(self)
+            self._test_timer.timeout.connect(self._advance_test_slate)
+            self._test_timer.start(TEST_ADVANCE_MS)
+        else:
+            self.refresh_games()
 
     def _init_fonts(self):
         scale = self.settings.get("font_scale_percent", 160) / 100.0
         # MLB-TCKR formula for pitcher/batter / player-info text
         pscale = self.settings.get("player_font_scale_percent", 75) / 100.0
-        ticker_request = self.settings.get("font", "Ozone") or "Ozone"
+        ticker_request = _ticker_font_request(self.settings)
         player_request = self.settings.get("player_info_font", "Gotham Black") or "Gotham Black"
         family = resolve_font_family(ticker_request, "Arial Black")
         player_family = resolve_font_family(player_request, family)
@@ -3542,20 +5113,37 @@ class NFLTicker(QtWidgets.QWidget):
         self.small_font_regular.setPixelSize(label_px)
         self.qb_faux_bold = False
 
-        # Down uses the player-info face; last play uses fonts/zed-sans-regular.ttf.
-        # Unscaled by font_scale_percent so clock + down + two play lines fit the bar.
+        # Down uses Ozone (ticker LED face, same as team names / scores /
+        # quarter table); last play uses fonts/PixelFont7-G02A.ttf (Pixel
+        # Font7, ~7px em). Integer size stays in the 8–14 band so glyphs
+        # stay crisp on a ~72px bar; unscaled by font_scale_percent so
+        # clock + down + up to three play lines fit. Down text is uppercased when
+        # drawn (Ozone has no readable lowercase).
         situation_px = max(10, int(h * 0.20))
-        play_px = max(6, int(h * 0.145) - 2)
+        # ~10px at h=72; clamp to 8–14 so the pixel face is not smeared.
+        play_px = max(8, min(14, int(h * 0.14)))
         if play_px >= situation_px:
-            play_px = max(6, situation_px - 2)
-        self.situation_font = QtGui.QFont(player_family)
+            play_px = max(8, situation_px - 2)
+        self.situation_font = QtGui.QFont(family)
         self.situation_font.setPixelSize(situation_px)
-        play_family, play_source = _load_bundled_font_file("zed-sans-regular.ttf")
+        play_family, play_source = _load_bundled_font_file("PixelFont7-G02A.ttf")
         if not play_family:
-            play_family = resolve_font_family("Zed Sans", player_family)
-            play_source = font_resolve_source("Zed Sans", player_family)
+            play_family = resolve_font_family("Pixel Font7", player_family)
+            play_source = font_resolve_source("Pixel Font7", player_family)
         self.play_font = QtGui.QFont(play_family)
         self.play_font.setPixelSize(play_px)
+
+        # Quarter / linescore grid: same LED face as team names and scores
+        # (Ozone). Heading (FINAL / HALFTIME) stays on time_font.
+        linescore_px = max(8, int(h * 0.125))
+        self.linescore_font = QtGui.QFont(family)
+        self.linescore_font.setPixelSize(linescore_px)
+
+        post_request = _postgame_font_request(self.settings)
+        post_family = resolve_font_family(post_request, player_family)
+        post_source = font_resolve_source(post_request, player_family)
+        self.postgame_font = QtGui.QFont(post_family)
+        self.postgame_font.setPixelSize(max(2, situation_px * 2))
 
         self.tiny_font = QtGui.QFont(family)
         self.tiny_font.setPixelSize(max(7, int(h * 0.15 * scale * pscale)))
@@ -3575,8 +5163,12 @@ class NFLTicker(QtWidgets.QWidget):
             f"{player_family} ({player_source})"
         )
         _dbg(
-            f"font last play request 'zed-sans-regular.ttf' -> "
+            f"font last play request 'PixelFont7-G02A.ttf' -> "
             f"{play_family} ({play_source})"
+        )
+        _dbg(
+            f"font post-game stats request '{post_request}' -> "
+            f"{post_family} ({post_source})"
         )
         for label, font in (
             ("team names", self.main_font),
@@ -3587,13 +5179,15 @@ class NFLTicker(QtWidgets.QWidget):
             ("qb labels (YDS TD INT)", self.small_font_regular),
             ("down and distance", self.situation_font),
             ("last play", self.play_font),
+            ("quarter table", self.linescore_font),
+            ("post-game stats", self.postgame_font),
             ("center sub line", self.small_font),
             ("version watermark", self.tiny_font),
         ):
             _dbg(f"font {label}: {_font_debug_desc(font)}")
         _dbg(
-            f"font quarter table: {_font_debug_desc(self.situation_font)} "
-            f"(sized down to fit the bar)"
+            f"font quarter table: {_font_debug_desc(self.linescore_font)} "
+            f"(sized down to fit the bar); heading uses time_font"
         )
         _dbg(f"font scoring alert: {family} (ticker face, sized to the bar)")
 
@@ -3663,6 +5257,7 @@ class NFLTicker(QtWidgets.QWidget):
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             self.settings = dlg.apply()
             save_settings(self.settings)
+            apply_proxy_settings()
             self._fullscreen_override_exes = {
                 x.lower()
                 for x in self.settings.get("fullscreen_override_exes", [])
@@ -3670,7 +5265,13 @@ class NFLTicker(QtWidgets.QWidget):
             new_height = int(self.settings.get("ticker_height", 72))
             self.ticker_height = new_height
             geo = self._screen.geometry()
-            self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
+            reserved = getattr(self, "_appbar_reserved_phys", None)
+            if reserved and self.settings.get("docked", True):
+                dpr = float(self.dpr) or 1.0
+                y = int(round(reserved[1] / dpr))
+                self.setGeometry(geo.x(), y, geo.width(), self.ticker_height)
+            else:
+                self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
             # Re-register AppBar after height / docked changes (needs live HWND size)
             self.remove_appbar()
             if self.settings.get("docked", True):
@@ -3687,10 +5288,25 @@ class NFLTicker(QtWidgets.QWidget):
         self.paused = not self.paused
 
     def refresh_games(self):
+        if _cli_test:
+            # Republish the fake slate; never hit ESPN in -test mode.
+            self._publish_strip()
+            return
         self._request_slate(True)
+
+    def _advance_test_slate(self):
+        """Tick fake live games, then rebuild cards via the normal strip path."""
+        if not _cli_test or not self.games:
+            return
+        self._test_tick = getattr(self, "_test_tick", 0) + 1
+        advance_test_games(self.games, self._test_tick)
+        self._detect_scoring_alerts(self.games)
+        self._publish_strip()
 
     def _request_slate(self, fetch):
         """Fetch off the UI thread. Card pixels are built on the UI thread."""
+        if _cli_test:
+            fetch = False
         if not fetch:
             self._publish_strip()
             return
@@ -3752,11 +5368,17 @@ class NFLTicker(QtWidgets.QWidget):
             self._start_slate_worker(self._job_gen)
 
     def _publish_strip(self):
-        """Queue card paints between frames. The cards on screen keep scrolling."""
+        """Queue changed cards on the GUI thread — one paint per event-loop turn."""
         layout = _layout_tuple(self.settings, self.ticker_height, self.dpr)
         if layout != self._card_cache_layout:
             self._card_cache = {}
+            self._card_base_cache = {}
             self._card_cache_layout = layout
+        live_ids = {g.get("game_id") for g in (self.games or [])}
+        if self._card_base_cache:
+            self._card_base_cache = {
+                k: v for k, v in self._card_base_cache.items() if k[0] in live_ids
+            }
         fp = _slate_fp(
             self.settings, self.games, self.qb_rotate_index,
             self.ticker_height, self.dpr,
@@ -3772,34 +5394,126 @@ class NFLTicker(QtWidgets.QWidget):
         if not games:
             image, _period = _render_strip(self, [])
             cards = [image] if image is not None and not image.isNull() else []
-            self._install_scroll_cards(cards, {}, fp)
+            self._install_scroll_cards(cards, {}, fp, complete=True)
             return
         order = []
         misses = []
         cache = {}
-        for g in games:
-            key = _game_visual_key(g, self.qb_rotate_index, self.settings)
+        for key, kind, game, side in _strip_card_jobs(
+            games, self.qb_rotate_index, self.settings
+        ):
             order.append(key)
             img = self._card_cache.get(key)
             if img is None:
-                misses.append((key, g))
+                misses.append((key, kind, game, side))
             else:
                 cache[key] = img
         self._build_order = order
         self._build_cache = cache
         if not misses:
             self._install_scroll_cards(
-                [cache[k] for k in order if k in cache], cache, fp,
+                [cache[k] for k in order if k in cache], cache, fp, complete=True,
             )
             return
         if not self._scroll_entries and not self._intro_hold:
             self._show_loading_card()
-        host = _FontHost(self)
-        thread = _CardBuildThread(host, misses, gen, fp)
-        self._slate_threads.append(thread)
-        thread.cards_ready.connect(self._on_cards_built, QtCore.Qt.QueuedConnection)
-        thread.finished.connect(lambda t=thread: self._drop_slate_thread(t))
-        thread.start()
+        # Keep prior images by strip index so unfinished slots stay on screen.
+        self._build_cards = [img for img, _w in (self._scroll_entries or [])[1:]]
+        self._build_jobs = misses
+        self._build_i = 0
+        self._build_host = _FontHost(self)
+        # Return to the event loop before the first QPainter so a pending
+        # HighEventPriority VBlank wake can run first.
+        QtCore.QTimer.singleShot(0, lambda g=gen: self._paint_one_build_card(g))
+
+    def _paint_one_build_card(self, gen):
+        """Paint exactly one missed card, install it, then yield to the event loop."""
+        if gen != self._build_gen:
+            return
+        jobs = self._build_jobs
+        i = self._build_i
+        if i >= len(jobs):
+            self._finish_card_build(gen)
+            return
+        key, kind, game, side = jobs[i]
+        host = self._build_host or self
+        try:
+            if kind == "post":
+                img = build_postgame_stats_card(host, game, side)
+            elif (
+                game.get("state") in ("in", "post")
+                and not bool(self.settings.get("glow_all"))
+            ):
+                # Logos and names (including team-name glow) stay on a cached
+                # base. Live ticks stamp the clock, down, play, score,
+                # timeouts, and possession icon. Finals stamp the passer line
+                # when it rotates. Glow-all is skipped: that halo is also
+                # drawn on the scores and the center text, and it spills
+                # outside the slots this stamp clears.
+                bkey = _game_base_key(
+                    game, host.qb_rotate_index, self.settings,
+                )
+                base = self._card_base_cache.get(bkey)
+                if base is None:
+                    base = build_game_card(
+                        host, game, host.qb_rotate_index, layer="base",
+                    )
+                    if base is not None and not base.isNull():
+                        self._card_base_cache[bkey] = base
+                if base is not None and not base.isNull():
+                    img = stamp_live_card(
+                        base, host, game, host.qb_rotate_index,
+                    )
+                else:
+                    img = build_game_card(host, game, host.qb_rotate_index)
+            else:
+                img = build_game_card(host, game, host.qb_rotate_index)
+            if img is not None and not img.isNull():
+                self._build_cache[key] = img
+        except Exception as e:
+            print(f"[CARD] {game.get('game_id')}: {e}")
+        self._build_i = i + 1
+        done = self._build_i >= len(jobs)
+        self._install_scroll_cards(
+            self._cards_for_build_install(),
+            dict(self._build_cache),
+            self._build_fp,
+            complete=done,
+        )
+        if not done:
+            # Normal-priority timer: VBlank HighEventPriority wakes run first.
+            QtCore.QTimer.singleShot(0, lambda g=gen: self._paint_one_build_card(g))
+        else:
+            self._finish_card_build(gen)
+
+    def _cards_for_build_install(self):
+        """New/cache hits plus prior images for slots not painted yet this build."""
+        order = self._build_order
+        cache = self._build_cache
+        prev = self._build_cards or []
+        cards = []
+        for idx, key in enumerate(order):
+            img = cache.get(key)
+            if img is None and idx < len(prev):
+                img = prev[idx]
+            if img is not None and not img.isNull():
+                cards.append(img)
+        return cards
+
+    def _finish_card_build(self, gen):
+        if gen != self._build_gen:
+            return
+        self._build_jobs = []
+        self._build_host = None
+        self._build_cards = []
+        # _install_scroll_cards(complete=True) already cleared _build_fp / set _slate_fp
+        if self._build_fp is not None:
+            self._install_scroll_cards(
+                self._cards_for_build_install(),
+                dict(self._build_cache),
+                self._build_fp,
+                complete=True,
+            )
 
     def _loop_marker_entry(self):
         """NFL shield card that leads the loop. Cached until height or DPR changes."""
@@ -3829,28 +5543,24 @@ class NFLTicker(QtWidgets.QWidget):
             self._prime_scroll_from_right()
         self.update()
 
-    def _on_cards_built(self, payload):
-        if payload.get("gen") != self._build_gen:
-            return
-        images = payload.get("images") or {}
-        cache = dict(self._build_cache)
-        cache.update(images)
-        cards = [cache[k] for k in self._build_order if cache.get(k) is not None]
-        self._install_scroll_cards(cards, cache, payload.get("fp"))
-
-    def _install_scroll_cards(self, cards, cache, fp):
+    def _install_scroll_cards(self, cards, cache, fp, card_widths=None, complete=True):
+        """Pointer-swap finished card images. No paint / scale / blur / compose."""
         h = int(self.ticker_height)
-        dpr = float(self.dpr)
         space_pct = max(0, min(200, int(self.settings.get("game_spacing_percent", 100))))
         gap = max(29, int(round(h * 1.80 * (space_pct / 100.0))))
+        dpr = float(self.dpr)
         entries = [self._loop_marker_entry()]
-        for img in cards:
+        for i, img in enumerate(cards):
             if img is None or img.isNull():
                 continue
-            idpr = float(img.devicePixelRatio()) or dpr
-            entries.append((img, max(1, int(round(img.width() / idpr)))))
+            if card_widths is not None and i < len(card_widths):
+                entries.append((img, int(card_widths[i])))
+            else:
+                idpr = float(img.devicePixelRatio()) or dpr
+                entries.append((img, max(1, int(round(img.width() / idpr)))))
         if not entries:
-            self._build_fp = None
+            if complete:
+                self._build_fp = None
             return
         period = float(sum(w for _img, w in entries) + len(entries) * gap)
         old_period = self._strip_w
@@ -3858,6 +5568,7 @@ class NFLTicker(QtWidgets.QWidget):
         self._scroll_entries = entries
         self._card_gap = gap
         self._strip_w = period
+        # Keep scroll_offset continuous — never reset on a content rebuild.
         if not self._intro_hold:
             if not self._scroll_primed:
                 self._prime_scroll_from_right()
@@ -3866,8 +5577,9 @@ class NFLTicker(QtWidgets.QWidget):
                     self.scroll_offset = self.scroll_offset % period
                 elif self.scroll_offset >= period:
                     self.scroll_offset = self.scroll_offset % period
-        self._slate_fp = fp
-        self._build_fp = None
+        if complete:
+            self._slate_fp = fp
+            self._build_fp = None
         self.update()
 
     def _prime_scroll_from_right(self):
@@ -3949,15 +5661,18 @@ class NFLTicker(QtWidgets.QWidget):
                 elif str(p.get("team_id")) == str(g.get("home_id")):
                     team_full = g.get("home_name") or team_full
                 nick = get_team_nickname(team_full) or p.get("team_abbr") or "TEAM"
-                text = format_scoring_alert_message(p, nick)
+                headline = format_scoring_alert_headline(p, nick)
+                detail = format_scoring_alert_message(p, nick)
                 color = get_team_color(team_full, self.settings)
                 self._alert_queue.append({
-                    "text": text,
+                    "headline": headline,
+                    "detail": detail,
+                    "text": detail,
                     "team_color": color,
                     "game_id": gid,
                     "play_id": pid,
                 })
-                _dbg(f"SCORE FLASH queued: {text} ({key})")
+                _dbg(f"SCORE FLASH queued: {headline} → {detail} ({key})")
         if self._current_alert is None and self._alert_queue:
             self._start_next_alert()
 
@@ -3968,7 +5683,11 @@ class NFLTicker(QtWidgets.QWidget):
         self._alert_phase = "in"
         self._alert_phase_start = self._elapsed.nsecsElapsed() / 1_000_000.0
         self._alert_timer.start(self._scroll_timer_interval_ms)
-        _dbg(f"SCORE FLASH showing: {self._current_alert.get('text')}")
+        _dbg(
+            f"SCORE FLASH showing: "
+            f"{self._current_alert.get('headline')} → "
+            f"{self._current_alert.get('detail')}"
+        )
         self.update()
 
     def _tick_alert(self):
@@ -4021,7 +5740,19 @@ class NFLTicker(QtWidgets.QWidget):
         vign.setColorAt(1.0, QtGui.QColor(0, 0, 0, 0))
         painter.fillRect(0, 0, w, h, vign)
 
-        text = alert.get("text") or ""
+        # Hold: headline for SCORE_ALERT_HEADLINE_MS, then detail. Slide-in
+        # shows headline; slide-out keeps the detail that was already up.
+        if phase == "out" or (
+            phase == "hold" and phase_elapsed_ms >= SCORE_ALERT_HEADLINE_MS
+        ):
+            text = alert.get("detail") or alert.get("text") or ""
+        else:
+            text = (
+                alert.get("headline")
+                or alert.get("detail")
+                or alert.get("text")
+                or ""
+            )
         family = load_ticker_font()
         min_px = max(10, int(h * 0.25))
         max_px = int(h * 0.58)
@@ -4150,7 +5881,7 @@ class NFLTicker(QtWidgets.QWidget):
         )
 
     def _rebuild_cards(self):
-        """Schedule a strip render off the UI thread."""
+        """Schedule a sliced GUI-thread card rebuild (one card per event-loop turn)."""
         self._request_slate(False)
 
     def _scroll_dbg_note_tick(self, tick_dt_ms, dx_px, paused, reason=""):
@@ -4429,6 +6160,8 @@ class NFLTicker(QtWidgets.QWidget):
             return
         if getattr(self, "_appbar_registered", False):
             return
+        if getattr(self, "_appbar_passive_dock", False):
+            return
         print("[AppBar] Not registered yet — retrying setup_appbar")
         self.setup_appbar()
 
@@ -4560,24 +6293,131 @@ class NFLTicker(QtWidgets.QWidget):
         self._force_shell_appbar = False
 
     def _check_sister_appbar_layout(self):
-        """Promote from passive dock when the sister above us leaves."""
+        """Promote from passive dock only when the strip above us is gone."""
         if sys.platform != "win32":
             return
         if not self.settings.get("docked", True):
             return
         if not getattr(self, "_appbar_passive_dock", False):
             return
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        if not hwnd:
+            return
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint32),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", ctypes.c_uint32),
+            ]
+
+        hmonitor = user32.MonitorFromWindow(hwnd, 0x00000002)
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+            return
+        foreign = int(getattr(self, "_appbar_stack_top_phys", 0) or 0)
+        if foreign <= 0:
+            self._promote_passive_dock_to_appbar()
+            return
         if self._other_sister_visible_on_monitor():
             self._sister_gone_streak = 0
+            self._park_window_at_reserved()
             return
-        # Sister gone — wait one poll so ABM_REMOVE can settle, then promote.
+        if self._window_occupies_top_inset(hmonitor, mi.rcMonitor.top, foreign):
+            self._sister_gone_streak = 0
+            self._park_window_at_reserved()
+            return
         streak = getattr(self, "_sister_gone_streak", 0) + 1
         self._sister_gone_streak = streak
-        if streak >= 1:
+        if streak >= 2:
             self._promote_passive_dock_to_appbar()
+
+    def _window_occupies_top_inset(self, hmonitor, phys_y, inset_h):
+        """True if some other visible window still sits in the reserved top strip."""
+        if inset_h <= 0:
+            return False
+        user32 = ctypes.windll.user32
+        our = int(self.winId())
+        found = False
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _enum_cb(hwnd, _lp):
+            nonlocal found
+            if found or hwnd == our or not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.MonitorFromWindow(hwnd, 0x00000002) != hmonitor:
+                return True
+            rc = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                return True
+            if rc.bottom <= phys_y or rc.top >= phys_y + inset_h:
+                return True
+            found = True
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        return found
+
+    def _park_window_at_reserved(self):
+        if sys.platform != "win32":
+            return
+        reserved = getattr(self, "_appbar_reserved_phys", None)
+        hwnd = int(self.winId()) if self.winId() else 0
+        if not reserved or not hwnd:
+            return
+        user32 = ctypes.windll.user32
+        wr = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        want_x, want_y = int(reserved[0]), int(reserved[1])
+        want_w = int(reserved[2] - reserved[0])
+        want_h = int(reserved[3] - reserved[1])
+        if wr.left == want_x and wr.top == want_y and wr.right - wr.left == want_w:
+            return
+        self._parking_appbar_window = True
+        try:
+            user32.SetWindowPos(
+                hwnd, 0, want_x, want_y, want_w, want_h, 0x0004 | 0x0010
+            )
+        finally:
+            self._parking_appbar_window = False
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if getattr(self, "_parking_appbar_window", False):
+            return
+        if not self.settings.get("docked", True):
+            return
+        if getattr(self, "_appbar_reserved_phys", None):
+            self._park_window_at_reserved()
 
     def _work_area_notify_allowed(self):
         return getattr(self, "_appbar_stack_top_phys", 0) == 0
+
+    def _prepare_hwnd_for_appbar(self, hwnd):
+        """Drop WS_EX_TOOLWINDOW so the shell includes this bar in the work area.
+
+        Qt.Tool sets TOOLWINDOW (no taskbar button). Explorer often ignores those
+        HWNDs when computing rcWork, so other windows open underneath the ticker.
+        """
+        if sys.platform != "win32" or not hwnd:
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        WS_EX_APPWINDOW = 0x00040000
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        new_style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+        if new_style != style:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            # Style changes on a live HWND need a frame nudge.
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                0x0001 | 0x0002 | 0x0004 | 0x0020,  # NOMOVE NOSIZE NOZORDER FRAMECHANGED
+            )
+            print("[AppBar] Cleared WS_EX_TOOLWINDOW so Explorer reserves this strip")
 
     def _notify_same_monitor_work_area_change(self):
         """Tell same-monitor windows to refresh work-area (no HWND_BROADCAST)."""
@@ -4589,9 +6429,8 @@ class NFLTicker(QtWidgets.QWidget):
         user32 = ctypes.windll.user32
         WM_SETTINGCHANGE = 0x001A
         SPI_SETWORKAREA = 0x002F
-        # Nudge Explorer / WM to re-read work area after AppBar SETPOS.
-        if self._is_primary_monitor_handle(hmonitor):
-            user32.SystemParametersInfoW(SPI_SETWORKAREA, 0, None, 0)
+        # Do not call SPI_SETWORKAREA with a NULL rect. Explorer rebuilds rcWork
+        # from AppBars it recognizes and can drop this ticker (Qt Tool HWND).
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
         def _enum_cb(hwnd, _lp):
@@ -4627,13 +6466,18 @@ class NFLTicker(QtWidgets.QWidget):
         mi = _MONITORINFO()
         mi.cbSize = ctypes.sizeof(_MONITORINFO)
         if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+            print("[AppBar] GetMonitorInfoW failed — cannot force work area")
             return False
-        # Already clear of our strip — shell AppBar path worked.
-        if mi.rcWork.top >= int(strip_bottom_phys):
+        need = int(strip_bottom_phys)
+        if mi.rcWork.top >= need:
+            print(
+                f"[AppBar] Work area already clear of strip "
+                f"(rcWork.top={mi.rcWork.top} >= {need})"
+            )
             return False
         rect = wintypes.RECT()
         rect.left = mi.rcWork.left
-        rect.top = int(strip_bottom_phys)
+        rect.top = need
         rect.right = mi.rcWork.right
         rect.bottom = mi.rcWork.bottom
         if rect.top >= rect.bottom:
@@ -4648,6 +6492,11 @@ class NFLTicker(QtWidgets.QWidget):
                 f"[AppBar] Forced SPI_SETWORKAREA top={rect.top} "
                 f"(was {mi.rcWork.top}; shell did not shrink work area)"
             )
+        else:
+            print(
+                f"[AppBar] SPI_SETWORKAREA FAILED err={ctypes.GetLastError()} "
+                f"wanted top={rect.top} (was {mi.rcWork.top})"
+            )
         return bool(ok)
 
     def _schedule_workarea_rebroadcasts(self):
@@ -4660,9 +6509,12 @@ class NFLTicker(QtWidgets.QWidget):
         def _rebroadcast():
             if gen != getattr(self, "_workarea_broadcast_gen", 0):
                 return
-            if not getattr(self, "_appbar_registered", False):
-                return
-            self._notify_same_monitor_work_area_change()
+            reserved = getattr(self, "_appbar_reserved_phys", None)
+            hmonitor = getattr(self, "_appbar_hmonitor", None)
+            if reserved and hmonitor:
+                self._force_work_area_below_strip(hmonitor, reserved[3])
+            if getattr(self, "_appbar_registered", False):
+                self._notify_same_monitor_work_area_change()
 
         QtCore.QTimer.singleShot(1000, _rebroadcast)
         QtCore.QTimer.singleShot(3000, _rebroadcast)
@@ -4771,6 +6623,49 @@ class NFLTicker(QtWidgets.QWidget):
             f"{abd.rc.right},{abd.rc.bottom})"
         )
 
+    def _apply_passive_top_dock(
+        self, hwnd, phys_x, phys_y, phys_width, phys_height, prior_top, hmonitor,
+    ):
+        """Sit below an existing top reservation without stealing that AppBar slot.
+
+        Still shrinks the work area so other windows start below NFL-TCKR.
+        """
+        user32 = ctypes.windll.user32
+        top_phys = int(phys_y + max(0, prior_top))
+        self._appbar_passive_dock = True
+        self._appbar_registered = False
+        self._appbar_stack_top_phys = int(max(0, prior_top))
+        self._appbar_reserved_phys = (
+            int(phys_x),
+            top_phys,
+            int(phys_x + phys_width),
+            top_phys + int(phys_height),
+        )
+        self._appbar_hmonitor = hmonitor
+        self._appbar_on_primary = self._is_primary_monitor_handle(hmonitor)
+        self._parking_appbar_window = True
+        try:
+            user32.SetWindowPos(
+                hwnd,
+                0,
+                int(phys_x),
+                top_phys,
+                int(phys_width),
+                int(phys_height),
+                0x0004 | 0x0010,  # SWP_NOZORDER | SWP_NOACTIVATE
+            )
+        finally:
+            self._parking_appbar_window = False
+        self._force_work_area_below_strip(hmonitor, top_phys + phys_height)
+        self._notify_same_monitor_work_area_change()
+        wr = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        print(
+            f"[AppBar] Passive dock below {prior_top}px reservation — "
+            f"window phys=({wr.left},{wr.top},{wr.right},{wr.bottom}), "
+            f"work-area top target={top_phys + phys_height}"
+        )
+
     def setup_appbar(self):
         """Register as Windows AppBar to reserve desktop space at the top.
 
@@ -4827,14 +6722,14 @@ class NFLTicker(QtWidgets.QWidget):
         phys_width = mi.rcMonitor.right - mi.rcMonitor.left
         prior_top_reserved = mi.rcWork.top - phys_y
         self._appbar_stack_top_phys = int(max(0, prior_top_reserved))
-
         if prior_top_reserved > 0:
             print(
                 f"[AppBar] {prior_top_reserved}px already reserved at top — "
-                f"QUERYPOS will stack NFL-TCKR below it (still registering AppBar)"
+                f"QUERYPOS will stack NFL-TCKR below it and still register"
             )
 
         self._appbar_passive_dock = False
+        self._prepare_hwnd_for_appbar(hwnd)
 
         abd = APPBARDATA()
         abd.cbSize = ctypes.sizeof(APPBARDATA)
@@ -4859,6 +6754,11 @@ class NFLTicker(QtWidgets.QWidget):
         # Preserve our exact height from the (possibly adjusted) top.
         abd.rc.bottom = abd.rc.top + phys_height
         shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
+        user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
+        print(
+            f"[AppBar] After SETPOS rcWork.top={mi.rcWork.top} "
+            f"strip=({abd.rc.left},{abd.rc.top},{abd.rc.right},{abd.rc.bottom})"
+        )
 
         self._appbar_reserved_phys = (
             int(abd.rc.left),
@@ -4872,15 +6772,26 @@ class NFLTicker(QtWidgets.QWidget):
         # Physical SetWindowPos — Qt setGeometry remaps via primary DPI.
         HWND_TOPMOST = -1
         SWP_NOACTIVATE = 0x0010
-        user32.SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            int(abd.rc.left),
-            int(abd.rc.top),
-            int(abd.rc.right - abd.rc.left),
-            int(abd.rc.bottom - abd.rc.top),
-            SWP_NOACTIVATE,
-        )
+        self._parking_appbar_window = True
+        try:
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                int(abd.rc.left),
+                int(abd.rc.top),
+                int(abd.rc.right - abd.rc.left),
+                int(abd.rc.bottom - abd.rc.top),
+                SWP_NOACTIVATE,
+            )
+        finally:
+            self._parking_appbar_window = False
+        wr = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        if wr.top != int(abd.rc.top):
+            print(
+                f"[AppBar] HWND snapped to y={wr.top}, re-parking at y={abd.rc.top}"
+            )
+            self._park_window_at_reserved()
         shell32.SHAppBarMessage(ABM_WINDOWPOSCHANGED, ctypes.byref(abd))
         shell32.SHAppBarMessage(ABM_ACTIVATE, ctypes.byref(abd))
 
@@ -4893,8 +6804,9 @@ class NFLTicker(QtWidgets.QWidget):
         _logical_height = int((abd.rc.bottom - abd.rc.top) / max(dpr, 0.01))
         print(
             f"[AppBar] Registered — DPR={dpr}, "
-            f"monitor phys=({phys_x},{phys_y},{phys_x + phys_width},{phys_y + phys_height}), "
+            f"monitor phys=({phys_x},{phys_y},{phys_x + phys_width},{mi.rcMonitor.bottom}), "
             f"reserved phys=({abd.rc.left},{abd.rc.top},{abd.rc.right},{abd.rc.bottom}), "
+            f"window phys=({wr.left},{wr.top},{wr.right},{wr.bottom}), "
             f"logical height={_logical_height}px"
         )
 
@@ -5065,6 +6977,7 @@ class NFLTicker(QtWidgets.QWidget):
 # ---------------------------------------------------------------------------
 def main():
     _ensure_appdata()
+    apply_proxy_settings()
     # High-DPI
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
@@ -5072,6 +6985,7 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("NFL-TCKR")
     print(f"[NFL-TCKR] v{VERSION}", flush=True)
+    register_all_font_files()
     print(
         f"[NFL-TCKR] DEBUG={'ON' if _NFL_DEBUG else 'OFF'} (env NFL_TCKR_DEBUG)",
         flush=True,
@@ -5092,6 +7006,8 @@ def main():
         )
     if _cli_faststart:
         print("[NFL-TCKR] --faststart: skip title hold", flush=True)
+    if _cli_test:
+        print("[NFL-TCKR] -test: fake live slate (no ESPN)", flush=True)
     print(f"[NFL-TCKR] logos: {LOGO_DIR}", flush=True)
     print(
         f"[NFL-TCKR] football icon: {FOOTBALL_ICON_PATH} "

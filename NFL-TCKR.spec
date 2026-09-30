@@ -8,6 +8,7 @@
 
 import os
 import sys
+import glob
 
 from PyInstaller.utils.hooks import collect_all as _pyi_collect_all
 
@@ -63,7 +64,21 @@ except Exception as _e:
     print(f"[SPEC] collect_all PyQt5 ERROR: {_e}")
 
 _datas = []
-for _folder in ("fonts", "logos", "images"):
+_fonts_dir = os.path.join(_spec_dir, "fonts")
+if os.path.isdir(_fonts_dir):
+    _font_count = 0
+    for _font in glob.glob(os.path.join(_fonts_dir, "*.ttf")) + glob.glob(
+        os.path.join(_fonts_dir, "*.otf")
+    ):
+        _abs = os.path.abspath(_font)
+        _datas.append((_abs, "fonts"))
+        _datas.append((_abs, "."))
+        _font_count += 1
+    print(f"[SPEC] Bundled {_font_count} font(s) from fonts/")
+else:
+    print(f"[SPEC] WARNING: fonts/ directory not found at {_fonts_dir}")
+
+for _folder in ("logos", "images"):
     _src = os.path.join(_spec_dir, _folder)
     if os.path.isdir(_src):
         _datas.append((_src, _folder))

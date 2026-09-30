@@ -1,6 +1,148 @@
 NFL-TCKR CHANGELOG
 ==================
 
+0.1.47 — 2026-09-29
+-------------------
+- Scroll: passer-line rotation on a final (and live) card stamps that line
+  onto the cached card. The names, logos, and team-name glow are not
+  repainted every 5 seconds.
+
+0.1.46 — 2026-09-29
+-------------------
+- Scroll: team-name glow stays on the cached card. Live ticks still stamp
+  only the clock, down, play, score, timeouts, and possession icon. Glow-all
+  still repaints the whole card.
+
+0.1.45 — 2026-09-29
+-------------------
+- Scroll: cache the stable part of each live card (names, logos) and stamp
+  only the clock, down, play, score, timeouts, and possession icon so a
+  tick does not rebuild the whole card on the GUI thread. Both possession
+  slots stay reserved so a possession flip does not change card width.
+
+0.1.44 — 2026-09-29
+-------------------
+- Scroll: paint changed cards on the GUI thread one per event-loop turn
+  (QTimer.singleShot(0)); install each image as it finishes so VBlank wakes
+  are not starved by a QThread holding the GIL in QPainter
+
+0.1.43 — 2026-09-29
+-------------------
+- Live cards: reserve center from clock + fixed down samples only; last play /
+  drive wraps up to 3 lines inside that column so scores sit closer
+
+0.1.42 — 2026-09-29
+-------------------
+- Scroll: yield the GIL during card rebuilds and install only finished images so
+  down / play / score updates do not drop a VBlank frame
+
+0.1.41 — 2026-09-29
+-------------------
+- Scoring flash: 3s all-caps type line (e.g. GIANTS TOUCHDOWN!), then 4s play detail
+- Detail form e.g. Giants Score: Scattebo 22 YD Run Touchdown!; hold is 7s total
+
+0.1.40 — 2026-09-29
+-------------------
+- Live cards: reserve fixed center and two-digit score columns so down / last-play /
+  score-digit updates do not change card width or shift logos and neighbors
+- Timeouts stay centered under the reserved score slot
+
+0.1.39 — 2026-09-29
+-------------------
+- Last play: Pixel Font7 (fonts/PixelFont7-G02A.ttf) at 8–14px with AA off for that line only
+
+0.1.38 — 2026-09-29
+-------------------
+- Live down line: Ozone LED face (uppercased); last-play text nudged down 2px
+
+0.1.37 — 2026-09-29
+-------------------
+- Live down line: "2nd & 7 on NYG 45" (word "on" instead of "@"; connector stays white)
+
+0.1.36 — 2026-09-29
+-------------------
+- Last play: Roboto Medium (fonts/Roboto-Medium.ttf) instead of Zed Sans Regular —
+  slightly thicker at the small play-line size
+- Quarter / linescore table: Ozone LED face for grid cells; FINAL/HALFTIME
+  heading stays on the clock/time face
+
+0.1.35 — 2026-09-29
+-------------------
+- Pregame center: larger gap between kickoff / network / spread; network and
+  spread fonts closer to kickoff size; away record sits left of the team name
+
+0.1.34 — 2026-09-29
+-------------------
+- Add `-test` / `--test` CLI mode: fake live slate (no ESPN) so the bar can be
+  demoed when no games are on; advances clocks / downs / plays every ~4.5s
+
+0.1.33 — 2026-09-29
+-------------------
+- Final cards: restore the center linescore table (periods only, OT when
+  present); remove compact quarter digits under each score
+- Linescore table no longer includes a redundant FINAL/total column on
+  finals or in-game quarter breaks
+
+0.1.32 — 2026-09-29
+-------------------
+- Live down line colors: 4th down gold, else red zone red, else possession
+  team color (clock blue / white when possession unknown); & and @ stay white
+- Settings → General: Show drive summary (mutually exclusive with last play);
+  bottom row shows "12 plays, 75 yards" from the current drive when available
+- Pregame cards: team records beside names, broadcast under kickoff, spread
+  in the center (hidden once live or final)
+- Final cards: compact quarter points under each score; no down / last play /
+  drive / possession; full linescore table kept for in-game quarter breaks
+
+0.1.31 — 2026-09-29
+-------------------
+- Glow all: keep halos cached (text, logos, possession icons) and drop the
+  oldest entry instead of wiping at 400. A full slate was rebuilding every
+  halo on the next card and holding the scroll clock for hundreds of ms
+  per card; the scroll blit itself stayed under 1ms
+- Card rebuild runs at low priority and yields between halos so a cold glow
+  pass cannot pin the machine
+
+0.1.30 — 2026-09-28
+-------------------
+- Settings → General: Include Post-Game Stats (off by default)
+- After each final score, scroll away then home PASS/RUSH/REC/SACKS/TACKLE
+  leaders (headers in that team's color, e.g. LAC PASS); post-game line is
+  2× situation size; Settings chooses the post-game stats typeface
+
+0.1.29 — 2026-09-28
+-------------------
+- QB line includes completions/attempts: #16 Lawrence 20/33 182 YDS, 3 TD, 1 INT
+  (live/final boxscore C/ATT and pregame season leader C/ATT)
+
+0.1.28 — 2026-09-28
+-------------------
+- AppBar always registers (ABM_NEW/QUERYPOS/SETPOS) so NFL reserves its own
+  strip below any existing top reservation; windows should not open underneath
+- Clear WS_EX_TOOLWINDOW before register so Explorer includes this HWND in rcWork
+- Stop SPI_SETWORKAREA(NULL) which rebuilt work area from AppBars and dropped us
+- Re-force work-area top to the bottom of our strip 1s and 3s after dock
+
+0.1.27 — 2026-09-28
+-------------------
+- Ticker face: ignore leftover Settings.json "Arial" and use bundled Ozone;
+  Settings → General now has a Ticker font list from fonts/
+- AppBar: if the top is already reserved, dock below it (do not steal y=0);
+  still shrink the work area so windows start below NFL-TCKR; re-park if Qt
+  snaps the HWND back to the screen top
+
+0.1.26 — 2026-09-28
+-------------------
+- Frozen exe: ship each fonts/*.ttf|otf into the onefile extract (fonts/ and root)
+- Register bundled faces after QApplication; exe prefers fonts-folder over installed
+- Search _MEIPASS/fonts, extract root, and a fonts/ folder next to the exe
+
+0.1.25 — 2026-09-28
+-------------------
+- Settings → Network tab: Enable Proxy + URL, optional SSL certificate file
+- ESPN fetches honor proxy (HTTP(S)_PROXY + requests proxies); corporate SSL
+  inspection uses a merged Windows CA bundle when no custom cert is set
+
 0.1.24 — 2026-09-27
 -------------------
 - Live center: fixed 4-row slots so clock Y stays put with or without last play;

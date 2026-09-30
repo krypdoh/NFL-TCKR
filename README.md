@@ -6,7 +6,7 @@ Displays a scrolling top-of-screen bar with team logos, colored names, scores,
 down & distance, last play, QB stats, ball-on field position, and a possession
 football icon.
 
-**Version:** 0.1.24  
+**Version:** 0.1.47  
 **Data:** ESPN public site API ([Public-ESPN-API](https://github.com/pseudo-r/Public-ESPN-API))
 
 ---
@@ -19,6 +19,9 @@ From the repo (or this folder), with the same Python env as MLB-TCKR:
 cd C:\Users\prc\Dropbox\github\MLB-TCKR\NFL-TCKR
 python NFL-TCKR.py
 ```
+
+Use `-test` (or `--test`) for a fake live slate with no ESPN calls — useful when
+there are no real games: `python NFL-TCKR.py -test`.
 
 Dependencies (already in the parent `requirements.txt`): `PyQt5`, `requests`.
 
@@ -57,7 +60,8 @@ Console lines tagged `[SCROLL]`:
 Settings are stored in `%APPDATA%\NFL-TCKR\NFL-TCKR.Settings.json`.
 
 - **General:** speed, refresh, height, docked AppBar, background/content transparency,
-  glow options, name display, filters
+  glow options, name display, filters, optional post-game PASS/RUSH/REC/SACKS/TACKLE
+  leaders after each final (with a chosen post-game stats font)
 - **Team Colors:** per-team Primary / Secondary / Tertiary / Custom (names + scoring flash)
 
 ## Layout (live games)
