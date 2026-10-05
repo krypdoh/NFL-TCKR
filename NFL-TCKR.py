@@ -12,7 +12,7 @@ public site API. Integrates with Windows AppBar for docked desktop reservation
 (same model as MLB-TCKR).
 """
 
-VERSION = "0.1.47"
+VERSION = "0.1.52"
 
 import ctypes
 from ctypes import wintypes
@@ -327,36 +327,47 @@ def get_settings():
         if _SETTINGS_CACHE is not None:
             return _SETTINGS_CACHE
     defaults = {
-        "speed": 5,
-        "update_interval": 15,
-        "ticker_height": 72,
+        "speed": 10,
+        "update_interval": 5,
+        "ticker_height": 64,
         "game_spacing_percent": 100,  # 100% ≈ 1.8× ticker height between cards
         "font": "Ozone",
         "font_scale_percent": 160,
         "player_info_font": "Gotham Black",  # Match MLB-TCKR player/stat text
         "player_font_scale_percent": 75,  # Match MLB-TCKR default
-        "show_team_cities": False,
+        "show_team_cities": True,
         "show_city_only": False,
         "use_city_abbreviations": False,
         "include_final_games": True,
-        "include_postgame_stats": False,
-        "postgame_font": "Gotham Black",
+        "include_postgame_stats": True,
+        "postgame_font": "Subway Ticker",
         "include_scheduled_games": True,
         "live_games_only": False,
-        "show_last_play": True,
-        "show_drive_summary": False,
+        "show_last_play": False,
+        "show_drive_summary": True,
         "show_qb_stats": True,
         "show_ball_on": True,
         "show_possession": True,
         "led_background": True,
         "background_opacity": 230,
         "content_opacity": 255,  # scores / logos / strip (MLB-TCKR pattern)
-        "glow_team_names": False,  # soft glow behind team names (team color)
+        "glow_team_names": True,  # soft glow behind team names (team color)
         "glow_all": False,  # glow behind all content; logos use faint white
         "monitor_index": 0,
         "team_name_color_slot": 0,
-        "team_colors": {},
+        "team_colors": {
+            "Bills": 1,
+            "Patriots": 1,
+            "Browns": 1,
+            "Steelers": 1,
+            "Bears": 1,
+            "Packers": 1,
+            "Texans": 1,
+            "Titans": 1,
+            "Seahawks": 1,
+        },
         "docked": True,  # AppBar desktop reservation (False = floating always-on-top)
+        "follow_team": "",  # nickname; F centers that game and pauses
         "fullscreen_override_exes": [],  # EXE basenames that never hide the ticker
         "use_proxy": False,
         "proxy": "",
@@ -4226,7 +4237,7 @@ def stamp_live_card(base, host, game, qb_rotate_index=0):
 # Settings dialog
 # ---------------------------------------------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
-    """Settings dialog with General, Team Colors, and Network tabs."""
+    """Settings dialog with General, Shortcuts, Team Colors, and Network tabs."""
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -4239,6 +4250,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._create_general_tab(), "General")
+        self.tabs.addTab(self._create_shortcuts_tab(), "Shortcuts")
         self.tabs.addTab(self._create_team_colors_tab(), "Team Colors")
         self.tabs.addTab(self._create_network_tab(), "Network")
         root.addWidget(self.tabs)
@@ -4279,6 +4291,19 @@ class SettingsDialog(QtWidgets.QDialog):
             "always-on-top ticker (no desktop reservation)."
         )
         layout.addRow(self.docked)
+
+        self.follow_team = QtWidgets.QComboBox()
+        self.follow_team.addItem("(none)", "")
+        for nick in sorted(NFL_TEAM_COLORS):
+            self.follow_team.addItem(nick, nick)
+        saved_follow = settings.get("follow_team") or ""
+        follow_idx = self.follow_team.findData(saved_follow)
+        self.follow_team.setCurrentIndex(follow_idx if follow_idx >= 0 else 0)
+        self.follow_team.setToolTip(
+            "Press F while the ticker is focused to center this team's game and pause. "
+            "Press F or P to resume."
+        )
+        layout.addRow("Follow Team:", self.follow_team)
 
         # Background transparency: 0% = solid bar, 100% = fully see-through
         opacity = max(0, min(255, int(settings.get("background_opacity", 230))))
@@ -4418,6 +4443,47 @@ class SettingsDialog(QtWidgets.QDialog):
         self.live_only.setChecked(settings.get("live_games_only", False))
         layout.addRow(self.live_only)
 
+        return widget
+
+    def _create_shortcuts_tab(self):
+        """Read-only list of keys that work while the ticker is focused."""
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(12, 12, 12, 12)
+        note = QtWidgets.QLabel(
+            "These keys work while the ticker is the active window. "
+            "Follow Team is chosen on the General tab."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        rows = [
+            ("P", "Pause or resume"),
+            ("Space", "Pause or resume"),
+            ("T", "Start the scroll from the beginning"),
+            ("R", "Replay the last scoring banner"),
+            ("F", "Center the Follow Team game and pause. F or P resumes."),
+            ("+", "Increase scroll speed"),
+            ("−", "Decrease scroll speed"),
+            ("S", "Open settings"),
+            ("Q", "Quit"),
+        ]
+        table = QtWidgets.QTableWidget(len(rows), 2)
+        table.setHorizontalHeaderLabels(["Key", "Action"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        table.setFocusPolicy(QtCore.Qt.NoFocus)
+        table.setShowGrid(False)
+        for row, (key, action) in enumerate(rows):
+            key_item = QtWidgets.QTableWidgetItem(key)
+            key_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            table.setItem(row, 0, key_item)
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem(action))
+        table.horizontalHeader().setStretchLastSection(True)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(0, 72)
+        layout.addWidget(table)
         return widget
 
     def _create_team_colors_tab(self):
@@ -4681,6 +4747,7 @@ class SettingsDialog(QtWidgets.QDialog):
         s["ticker_height"] = self.height.value()
         s["font"] = self.font_combo.currentText().strip() or "Ozone"
         s["docked"] = self.docked.isChecked()
+        s["follow_team"] = self.follow_team.currentData() or ""
         # Invert UI transparency % → stored alpha (0=clear, 255=opaque)
         s["background_opacity"] = int(
             round(255 * (100 - self.transparency.value()) / 100)
@@ -4905,6 +4972,9 @@ class NFLTicker(QtWidgets.QWidget):
         self._intro_hold = not _cli_faststart
         self._scroll_primed = False  # first loop enters from the right
         self.paused = False
+        self._key_paused = False  # P / Space latch; hover does not clear it
+        self._follow_hold = False  # F centered the follow-team game
+        self._scroll_entry_teams = []
         self.qb_rotate_index = 0
         self._fetching = False
         self._worker_busy = False
@@ -4943,6 +5013,7 @@ class NFLTicker(QtWidgets.QWidget):
         self._appbar_on_primary = True
         self._appbar_stack_top_phys = 0
         self._sister_gone_streak = 0
+        self._dock_clear_streak = 0
         self._force_shell_appbar = False
         self._appbar_init_done = False
         self._parking_appbar_window = False
@@ -4954,6 +5025,7 @@ class NFLTicker(QtWidgets.QWidget):
         # Scoring-play flash (MLB-style sweep overlay)
         self._alert_queue = []
         self._current_alert = None
+        self._last_scoring_alert = None
         self._alert_phase = "idle"  # idle | in | hold | out
         self._alert_phase_start = 0.0
         self._seen_scoring_ids = set()  # "gameId:playId" already observed
@@ -4972,6 +5044,7 @@ class NFLTicker(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
         self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setWindowTitle("NFL-TCKR")
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(
@@ -5265,15 +5338,11 @@ class NFLTicker(QtWidgets.QWidget):
             new_height = int(self.settings.get("ticker_height", 72))
             self.ticker_height = new_height
             geo = self._screen.geometry()
-            reserved = getattr(self, "_appbar_reserved_phys", None)
-            if reserved and self.settings.get("docked", True):
-                dpr = float(self.dpr) or 1.0
-                y = int(round(reserved[1] / dpr))
-                self.setGeometry(geo.x(), y, geo.width(), self.ticker_height)
-            else:
-                self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
-            # Re-register AppBar after height / docked changes (needs live HWND size)
+            # Release the old strip first. Re-parking on that rect, or reading
+            # the work area it left behind, is what dropped the bar one slot
+            # lower on every Apply.
             self.remove_appbar()
+            self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
             if self.settings.get("docked", True):
                 self.setup_appbar()
             self._init_fonts()
@@ -5285,7 +5354,22 @@ class NFLTicker(QtWidgets.QWidget):
             self.refresh_games()
 
     def toggle_pause(self):
+        # Latch follows the visible state so P unpauses a hover pause,
+        # and a key pause stays put after the pointer leaves the bar.
         self.paused = not self.paused
+        self._key_paused = self.paused
+        if not self.paused:
+            self._follow_hold = False
+
+    def _bump_speed(self, delta):
+        speed = int(self.settings.get("speed", 10))
+        new_speed = max(1, min(30, speed + int(delta)))
+        if new_speed == speed:
+            return
+        self.settings["speed"] = new_speed
+        save_settings(self.settings)
+        self._update_scroll_speed()
+        print(f"[NFL-TCKR] speed {new_speed}")
 
     def refresh_games(self):
         if _cli_test:
@@ -5539,6 +5623,7 @@ class NFLTicker(QtWidgets.QWidget):
         entries = [self._loop_marker_entry(), (image, width)]
         self._scroll_entries = entries
         self._strip_w = float(sum(w for _img, w in entries) + len(entries) * gap)
+        self._scroll_entry_teams = [()] * len(entries)
         if not self._intro_hold and not self._scroll_primed:
             self._prime_scroll_from_right()
         self.update()
@@ -5580,7 +5665,93 @@ class NFLTicker(QtWidgets.QWidget):
         if complete:
             self._slate_fp = fp
             self._build_fp = None
+        self._tag_scroll_entries()
+        if complete and getattr(self, "_follow_hold", False):
+            nick = (self.settings.get("follow_team") or "").strip()
+            if nick:
+                self._center_team_card(nick)
         self.update()
+
+    def _job_team_nicks(self, kind, game, side):
+        if kind == "game":
+            return (
+                get_team_nickname(game.get("away_name") or ""),
+                get_team_nickname(game.get("home_name") or ""),
+            )
+        full = game.get("away_name") if side == "away" else game.get("home_name")
+        return (get_team_nickname(full or ""),)
+
+    def _tag_scroll_entries(self):
+        """Pair each strip card with the team nicknames drawn on it.
+
+        Entry 0 is the loop marker. Game cards carry both teams so Follow
+        can center that game rather than a post-game stats line.
+        """
+        jobs = list(
+            _strip_card_jobs(self.games or [], self.qb_rotate_index, self.settings)
+        )
+        tags = [()]
+        card_n = max(0, len(self._scroll_entries) - 1)
+        if card_n == len(jobs):
+            for _key, kind, game, side in jobs:
+                tags.append(self._job_team_nicks(kind, game, side))
+        else:
+            for _key, kind, game, side in jobs[:card_n]:
+                tags.append(self._job_team_nicks(kind, game, side))
+        while len(tags) < len(self._scroll_entries):
+            tags.append(())
+        self._scroll_entry_teams = tags[: len(self._scroll_entries)]
+
+    def _center_team_card(self, nick):
+        """Place the team's game card in the middle of the bar. True if found."""
+        want = (nick or "").strip().lower()
+        tags = getattr(self, "_scroll_entry_teams", None) or []
+        if not want or not self._scroll_entries or self._strip_w <= 0:
+            return False
+        idx = None
+        for i, team_nicks in enumerate(tags):
+            if not any(str(t).lower() == want for t in team_nicks):
+                continue
+            idx = i
+            if len(team_nicks) >= 2:
+                break
+        if idx is None:
+            print(f"[NFL-TCKR] Follow: {nick} is not on the ticker")
+            return False
+        start = 0.0
+        gap = float(self._card_gap)
+        for i, (_img, cw) in enumerate(self._scroll_entries):
+            if i == idx:
+                view = float(max(1, self.width()))
+                offset = start - (view - float(cw)) / 2.0
+                period = float(self._strip_w)
+                if period > 0:
+                    offset %= period
+                self.scroll_offset = offset
+                self._scroll_primed = True
+                if self._intro_hold:
+                    self._intro_hold = False
+                    intro = getattr(self, "_intro_timer", None)
+                    if intro is not None and intro.isActive():
+                        intro.stop()
+                self.update()
+                return True
+            start += float(cw) + gap
+        return False
+
+    def _toggle_follow_team(self):
+        """Center the Follow Team game and pause, or resume if already held."""
+        if getattr(self, "_follow_hold", False):
+            self.paused = False
+            self._key_paused = False
+            self._follow_hold = False
+            return
+        nick = (self.settings.get("follow_team") or "").strip()
+        if not nick or not self._center_team_card(nick):
+            return
+        self.paused = True
+        self._key_paused = True
+        self._follow_hold = True
 
     def _prime_scroll_from_right(self):
         """Place the first card just off the right edge so the loop walks in."""
@@ -5680,6 +5851,7 @@ class NFLTicker(QtWidgets.QWidget):
         if not self._alert_queue:
             return
         self._current_alert = self._alert_queue.pop(0)
+        self._last_scoring_alert = dict(self._current_alert)
         self._alert_phase = "in"
         self._alert_phase_start = self._elapsed.nsecsElapsed() / 1_000_000.0
         self._alert_timer.start(self._scroll_timer_interval_ms)
@@ -6121,24 +6293,66 @@ class NFLTicker(QtWidgets.QWidget):
             cost = (time.perf_counter() - _paint_t0) * 1000.0
             self._scroll_dbg_note_paint(paint_dt, cost)
 
+    def _reset_ticker_scroll(self):
+        """Start the strip over, first card just off the right edge."""
+        self._intro_hold = False
+        intro = getattr(self, "_intro_timer", None)
+        if intro is not None and intro.isActive():
+            intro.stop()
+        self.scroll_offset = -float(max(1, self.width()))
+        self._scroll_primed = bool(self._scroll_entries and self._strip_w > 0)
+        self.update()
+
+    def _replay_last_scoring_alert(self):
+        """Play the most recent scoring banner again from the sweep-in."""
+        last = getattr(self, "_last_scoring_alert", None)
+        if not last:
+            return
+        self._current_alert = dict(last)
+        self._alert_phase = "in"
+        self._alert_phase_start = self._elapsed.nsecsElapsed() / 1_000_000.0
+        if not self._alert_timer.isActive():
+            self._alert_timer.start(self._scroll_timer_interval_ms)
+        self.update()
+
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_Space:
+        key = event.key()
+        speed_key = key in (
+            QtCore.Qt.Key_Plus,
+            QtCore.Qt.Key_Minus,
+            QtCore.Qt.Key_Equal,
+        )
+        if event.isAutoRepeat() and not speed_key:
+            return
+        if key in (QtCore.Qt.Key_P, QtCore.Qt.Key_Space):
             self.toggle_pause()
-        elif event.key() == QtCore.Qt.Key_R:
-            self.refresh_games()
-        elif event.key() == QtCore.Qt.Key_S:
+        elif key == QtCore.Qt.Key_T:
+            self._reset_ticker_scroll()
+        elif key == QtCore.Qt.Key_R:
+            self._replay_last_scoring_alert()
+        elif key == QtCore.Qt.Key_F:
+            self._toggle_follow_team()
+        elif key == QtCore.Qt.Key_Plus or (
+            key == QtCore.Qt.Key_Equal
+            and event.modifiers() & QtCore.Qt.ShiftModifier
+        ):
+            self._bump_speed(1)
+        elif key == QtCore.Qt.Key_Minus:
+            self._bump_speed(-1)
+        elif key == QtCore.Qt.Key_S:
             self.open_settings()
-        elif event.key() == QtCore.Qt.Key_Q:
+        elif key == QtCore.Qt.Key_Q:
             QtWidgets.QApplication.quit()
         else:
             super().keyPressEvent(event)
 
     def enterEvent(self, event):
-        self.paused = True
+        if not self._key_paused:
+            self.paused = True
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.paused = False
+        self.paused = self._key_paused
         super().leaveEvent(event)
 
     def showEvent(self, event):
@@ -6151,6 +6365,9 @@ class NFLTicker(QtWidgets.QWidget):
                 QtCore.QTimer.singleShot(100, self.setup_appbar)
                 # Retry once if the first attempt could not register.
                 QtCore.QTimer.singleShot(500, self._ensure_appbar_registered)
+                # Another dock often reserves the top after our first register.
+                QtCore.QTimer.singleShot(700, self._sync_appbar_below_top_docks)
+                QtCore.QTimer.singleShot(1800, self._sync_appbar_below_top_docks)
             if not self._fullscreen_timer.isActive():
                 self._fullscreen_timer.start()
 
@@ -6361,6 +6578,127 @@ class NFLTicker(QtWidgets.QWidget):
         user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
         return found
 
+    def _bar_height_phys(self, hwnd, dpr):
+        """Physical height of the strip we must keep clear.
+
+        Uses whichever of the client, the window, and the requested bar
+        height is tallest so the work area is not shorter than the pixels
+        on screen.
+        """
+        user32 = ctypes.windll.user32
+        client = wintypes.RECT()
+        window = wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(client))
+        user32.GetWindowRect(hwnd, ctypes.byref(window))
+        client_h = int(client.bottom - client.top)
+        window_h = int(window.bottom - window.top)
+        requested = max(1, math.ceil(float(self.ticker_height) * float(dpr or 1.0)))
+        return max(client_h, window_h, requested, 1)
+
+    def _top_dock_inset_phys(self):
+        """Physical pixels from the monitor top down to the bottom of other docks.
+
+        A short, wide window in the top band counts even when it is not a
+        shell AppBar. Windows already sitting below this bar do not count, or
+        two bars would chase each other down the screen.
+
+        rcWork is intentionally ignored. That inset still contains our own
+        strip after Apply and after quit, and treating it as a foreign dock
+        parked the next bar under an empty gap.
+        """
+        if sys.platform != "win32":
+            return 0
+        user32 = ctypes.windll.user32
+        our = int(self.winId())
+        if not our:
+            return 0
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint32),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", ctypes.c_uint32),
+            ]
+
+        hmonitor = user32.MonitorFromWindow(our, 0x00000002)
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+            return 0
+        phys_y = int(mi.rcMonitor.top)
+        mon_h = int(mi.rcMonitor.bottom - mi.rcMonitor.top)
+        mon_w = int(mi.rcMonitor.right - mi.rcMonitor.left)
+        if mon_h <= 0 or mon_w <= 0:
+            return 0
+        max_bar_h = max(160, int(mon_h * 0.22))
+        min_w = int(mon_w * 0.45)
+        our_rc = wintypes.RECT()
+        user32.GetWindowRect(our, ctypes.byref(our_rc))
+        our_top = int(our_rc.top)
+        our_bottom = int(our_rc.bottom)
+        inset = 0
+
+        dwm_cloaked = None
+        try:
+            dwm_cloaked = ctypes.windll.dwmapi.DwmGetWindowAttribute
+        except Exception:
+            dwm_cloaked = None
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _enum_cb(hwnd, _lp):
+            nonlocal inset
+            hwnd = int(hwnd)
+            if hwnd == our or not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.IsIconic(hwnd):
+                return True
+            if dwm_cloaked is not None:
+                cloaked = ctypes.c_int(0)
+                if dwm_cloaked(hwnd, 14, ctypes.byref(cloaked), 4) == 0 and cloaked.value:
+                    return True
+            if user32.MonitorFromWindow(hwnd, 0x00000002) != hmonitor:
+                return True
+            rc = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                return True
+            height = int(rc.bottom - rc.top)
+            if height <= 4 or height > max_bar_h:
+                return True
+            overlap_w = min(int(rc.right), int(mi.rcMonitor.right)) - max(
+                int(rc.left), int(mi.rcMonitor.left)
+            )
+            if overlap_w < min_w:
+                return True
+            their_top = int(rc.top)
+            their_bottom = int(rc.bottom)
+            # Already stacked under us. Following them walks the bar downward.
+            if their_top >= our_bottom - 2:
+                return True
+            if their_top > phys_y + max_bar_h:
+                return True
+            # Same edge as an older sister: they keep the slot. Both yielding
+            # would swap places on every pass.
+            overlaps = their_bottom > our_top + 2 and their_top >= our_top - 2
+            if overlaps and self._is_sister_ticker_hwnd(hwnd) and our < hwnd:
+                return True
+            inset = max(inset, their_bottom - phys_y)
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        return int(max(0, inset))
+
+    def _sync_appbar_below_top_docks(self):
+        """Move this bar down when another top dock appears after we registered."""
+        if sys.platform != "win32":
+            return
+        if not self.settings.get("docked", True):
+            return
+        if not getattr(self, "_appbar_registered", False):
+            return
+        self._refresh_appbar_geometry(notify_work_area=False, reason="top-dock")
+
     def _park_window_at_reserved(self):
         if sys.platform != "win32":
             return
@@ -6469,18 +6807,17 @@ class NFLTicker(QtWidgets.QWidget):
             print("[AppBar] GetMonitorInfoW failed — cannot force work area")
             return False
         need = int(strip_bottom_phys)
-        if mi.rcWork.top >= need:
-            print(
-                f"[AppBar] Work area already clear of strip "
-                f"(rcWork.top={mi.rcWork.top} >= {need})"
-            )
+        # Equal (within a pixel or two): nothing to do. A larger rcWork.top is a
+        # stale reservation from our own previous strip — pull it back up.
+        # A smaller one means the shell never cleared our bar — push it down.
+        if abs(int(mi.rcWork.top) - need) <= 2:
             return False
         rect = wintypes.RECT()
         rect.left = mi.rcWork.left
         rect.top = need
         rect.right = mi.rcWork.right
         rect.bottom = mi.rcWork.bottom
-        if rect.top >= rect.bottom:
+        if rect.top >= rect.bottom or rect.top < int(mi.rcMonitor.top):
             return False
         SPIF_UPDATEINIFILE = 0x01
         SPIF_SENDCHANGE = 0x02
@@ -6488,9 +6825,10 @@ class NFLTicker(QtWidgets.QWidget):
             0x002F, 0, ctypes.byref(rect), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
         )
         if ok:
+            verb = "up" if int(mi.rcWork.top) > need else "down"
             print(
-                f"[AppBar] Forced SPI_SETWORKAREA top={rect.top} "
-                f"(was {mi.rcWork.top}; shell did not shrink work area)"
+                f"[AppBar] Work area pulled {verb} to top={rect.top} "
+                f"(was {mi.rcWork.top})"
             )
         else:
             print(
@@ -6501,36 +6839,36 @@ class NFLTicker(QtWidgets.QWidget):
 
     def _schedule_workarea_rebroadcasts(self):
         """Re-notify same-monitor windows after AppBar registration settles."""
-        if not getattr(self, "_appbar_on_primary", False):
-            return
         self._workarea_broadcast_gen = getattr(self, "_workarea_broadcast_gen", 0) + 1
         gen = self._workarea_broadcast_gen
 
         def _rebroadcast():
             if gen != getattr(self, "_workarea_broadcast_gen", 0):
                 return
-            reserved = getattr(self, "_appbar_reserved_phys", None)
+            if not getattr(self, "_appbar_registered", False):
+                return
             hmonitor = getattr(self, "_appbar_hmonitor", None)
-            if reserved and hmonitor:
-                self._force_work_area_below_strip(hmonitor, reserved[3])
-            if getattr(self, "_appbar_registered", False):
-                self._notify_same_monitor_work_area_change()
+            bottom = self._window_bottom_phys()
+            reserved = getattr(self, "_appbar_reserved_phys", None)
+            if bottom is None and reserved:
+                bottom = int(reserved[3])
+            if hmonitor and bottom is not None:
+                self._force_work_area_below_strip(hmonitor, bottom)
+            self._notify_same_monitor_work_area_change()
 
         QtCore.QTimer.singleShot(1000, _rebroadcast)
         QtCore.QTimer.singleShot(3000, _rebroadcast)
 
-    def _appbar_slot_top_phys(self, phys_y, work_top_offset, phys_height):
-        """Physical Y offset from monitor top where our AppBar strip should start."""
-        old = getattr(self, "_appbar_reserved_phys", None)
-        if old is not None:
-            our_top = old[1] - phys_y
-            our_bottom = old[3] - phys_y
-            if work_top_offset >= our_bottom:
-                return our_top
-            if work_top_offset > our_top:
-                return work_top_offset
-            return our_top
-        return work_top_offset
+    def _window_bottom_phys(self):
+        if sys.platform != "win32":
+            return None
+        hwnd = int(self.winId()) if self.winId() else 0
+        if not hwnd:
+            return None
+        wr = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(wr)):
+            return None
+        return int(wr.bottom)
 
     def _refresh_appbar_geometry(self, notify_work_area=False, reason=""):
         if sys.platform != "win32":
@@ -6544,11 +6882,7 @@ class NFLTicker(QtWidgets.QWidget):
         screen = getattr(self, "_target_screen", QtWidgets.QApplication.primaryScreen())
         dpr = float(screen.devicePixelRatio()) if screen else 1.0
 
-        client_rect = wintypes.RECT()
-        user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-        phys_height = client_rect.bottom - client_rect.top
-        if phys_height <= 0:
-            phys_height = max(1, math.ceil(self.ticker_height * dpr))
+        phys_height = self._bar_height_phys(hwnd, dpr)
 
         class _MONITORINFO(ctypes.Structure):
             _fields_ = [
@@ -6566,8 +6900,27 @@ class NFLTicker(QtWidgets.QWidget):
         phys_x = mi.rcMonitor.left
         phys_y = mi.rcMonitor.top
         phys_width = mi.rcMonitor.right - mi.rcMonitor.left
-        work_top_offset = mi.rcWork.top - phys_y
-        slot_top = self._appbar_slot_top_phys(phys_y, work_top_offset, phys_height)
+        # Window docks first, then QUERYPOS for shell AppBars (taskbar).
+        # Propose the monitor edge so QUERYPOS does not stack us a second
+        # time under a slot we already occupy.
+        foreign = int(self._top_dock_inset_phys())
+        # rcWork includes this bar once we are docked. Only the part below
+        # our strip and below any other dock is an empty gap left by a
+        # previous run.
+        occupied = foreign
+        reserved_now = getattr(self, "_appbar_reserved_phys", None)
+        if reserved_now:
+            occupied = max(occupied, int(reserved_now[3] - phys_y))
+        else:
+            wr_now = wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(wr_now)):
+                occupied = max(occupied, int(wr_now.bottom - phys_y))
+        work_gap = max(0, int(mi.rcWork.top - phys_y))
+        if work_gap > occupied + 2:
+            print(
+                f"[AppBar] Ignoring {work_gap - occupied}px empty work-area gap "
+                f"(rcWork inset {work_gap}px, docks {foreign}px)"
+            )
 
         abd = APPBARDATA()
         abd.cbSize = ctypes.sizeof(APPBARDATA)
@@ -6575,12 +6928,17 @@ class NFLTicker(QtWidgets.QWidget):
         abd.uCallbackMessage = WM_APPBAR
         abd.uEdge = ABE_TOP
         abd.rc.left = phys_x
-        abd.rc.top = phys_y + slot_top
+        abd.rc.top = phys_y
         abd.rc.right = phys_x + phys_width
-        abd.rc.bottom = abd.rc.top + phys_height
+        abd.rc.bottom = phys_y + phys_height
 
         shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd))
-        abd.rc.bottom = abd.rc.top + phys_height
+        shell_top = int(abd.rc.top)
+        if shell_top < phys_y:
+            shell_top = phys_y
+        desired_top = max(shell_top, phys_y + foreign)
+        abd.rc.top = desired_top
+        abd.rc.bottom = desired_top + phys_height
 
         new_reserved = (
             int(abd.rc.left),
@@ -6589,29 +6947,59 @@ class NFLTicker(QtWidgets.QWidget):
             int(abd.rc.bottom),
         )
         old_reserved = getattr(self, "_appbar_reserved_phys", None)
+        from_shell = reason == "ABN_POSCHANGED"
+        if (
+            old_reserved
+            and new_reserved[1] < int(old_reserved[1]) - 2
+            and not from_shell
+        ):
+            # Moving up into a gap that just opened. Confirm twice so a
+            # one-pass miss of the dock above us does not cover it.
+            self._dock_clear_streak = getattr(self, "_dock_clear_streak", 0) + 1
+            if self._dock_clear_streak < 2:
+                return
+        self._dock_clear_streak = 0
+
         if old_reserved == new_reserved:
+            wr = wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(wr)) and abs(int(wr.top) - int(new_reserved[1])) > 2:
+                self._park_window_at_reserved()
+                user32.GetWindowRect(hwnd, ctypes.byref(wr))
+            bottom = int(wr.bottom) if wr.bottom else int(new_reserved[3])
+            self._force_work_area_below_strip(
+                hmonitor, max(int(new_reserved[3]), bottom)
+            )
             return
 
-        if old_reserved is None or slot_top != old_reserved[1] - phys_y:
-            self._appbar_stack_top_phys = int(abd.rc.top - phys_y)
-
+        self._appbar_stack_top_phys = int(abd.rc.top - phys_y)
         shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
         self._appbar_reserved_phys = new_reserved
         self._appbar_hmonitor = hmonitor
 
         HWND_TOPMOST = -1
-        user32.SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            int(abd.rc.left),
-            int(abd.rc.top),
-            int(abd.rc.right - abd.rc.left),
-            int(abd.rc.bottom - abd.rc.top),
-            0x0010,  # SWP_NOACTIVATE
-        )
+        self._parking_appbar_window = True
+        try:
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                int(abd.rc.left),
+                int(abd.rc.top),
+                int(abd.rc.right - abd.rc.left),
+                int(abd.rc.bottom - abd.rc.top),
+                0x0010,  # SWP_NOACTIVATE
+            )
+        finally:
+            self._parking_appbar_window = False
+        wr = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        covered_bottom = max(int(abd.rc.bottom), int(wr.bottom))
+        if int(wr.top) != int(abd.rc.top) or int(wr.bottom) < covered_bottom - 2:
+            self._park_window_at_reserved()
+            user32.GetWindowRect(hwnd, ctypes.byref(wr))
+            covered_bottom = max(covered_bottom, int(wr.bottom))
         shell32.SHAppBarMessage(ABM_WINDOWPOSCHANGED, ctypes.byref(abd))
         shell32.SHAppBarMessage(ABM_ACTIVATE, ctypes.byref(abd))
-        self._force_work_area_below_strip(hmonitor, abd.rc.bottom)
+        self._force_work_area_below_strip(hmonitor, covered_bottom)
 
         if notify_work_area:
             self._notify_same_monitor_work_area_change()
@@ -6620,7 +7008,8 @@ class NFLTicker(QtWidgets.QWidget):
         print(
             f"[AppBar] Refreshed position{tag} — "
             f"reserved phys=({abd.rc.left},{abd.rc.top},"
-            f"{abd.rc.right},{abd.rc.bottom})"
+            f"{abd.rc.right},{covered_bottom}) "
+            f"window=({wr.left},{wr.top},{wr.right},{wr.bottom})"
         )
 
     def _apply_passive_top_dock(
@@ -6669,9 +7058,9 @@ class NFLTicker(QtWidgets.QWidget):
     def setup_appbar(self):
         """Register as Windows AppBar to reserve desktop space at the top.
 
-        Always registers with the shell when docked. ABM_QUERYPOS stacks us below
-        any existing top reservations (taskbar / sister TCKR). The old "passive
-        dock" path skipped ABM_SETPOS entirely, so the bar never reserved space.
+        Always registers with the shell when docked. Position comes from other
+        dock windows and ABM_QUERYPOS, not from the current work-area inset.
+        That inset still contains our own strip after Apply and after quit.
         """
         if sys.platform != "win32":
             return
@@ -6693,16 +7082,7 @@ class NFLTicker(QtWidgets.QWidget):
 
         screen = getattr(self, "_target_screen", QtWidgets.QApplication.primaryScreen())
         dpr = float(screen.devicePixelRatio()) if screen else 1.0
-
-        client_rect = wintypes.RECT()
-        user32.GetClientRect(hwnd, ctypes.byref(client_rect))
-        phys_height = client_rect.bottom - client_rect.top
-        if phys_height <= 0:
-            phys_height = max(1, math.ceil(self.ticker_height * dpr))
-            print(
-                f"[AppBar] Warning: GetClientRect height=0; "
-                f"fallback phys_height={phys_height}px"
-            )
+        phys_height = self._bar_height_phys(hwnd, dpr)
 
         class _MONITORINFO(ctypes.Structure):
             _fields_ = [
@@ -6715,20 +7095,13 @@ class NFLTicker(QtWidgets.QWidget):
         hmonitor = user32.MonitorFromWindow(hwnd, 0x00000002)
         mi = _MONITORINFO()
         mi.cbSize = ctypes.sizeof(_MONITORINFO)
-        user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
-
-        phys_x = mi.rcMonitor.left
-        phys_y = mi.rcMonitor.top
-        phys_width = mi.rcMonitor.right - mi.rcMonitor.left
-        prior_top_reserved = mi.rcWork.top - phys_y
-        self._appbar_stack_top_phys = int(max(0, prior_top_reserved))
-        if prior_top_reserved > 0:
-            print(
-                f"[AppBar] {prior_top_reserved}px already reserved at top — "
-                f"QUERYPOS will stack NFL-TCKR below it and still register"
-            )
+        if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+            print("[AppBar] GetMonitorInfoW failed — cannot register")
+            return
 
         self._appbar_passive_dock = False
+        self._appbar_hmonitor = hmonitor
+        self._appbar_on_primary = self._is_primary_monitor_handle(hmonitor)
         self._prepare_hwnd_for_appbar(hwnd)
 
         abd = APPBARDATA()
@@ -6736,10 +7109,10 @@ class NFLTicker(QtWidgets.QWidget):
         abd.hWnd = hwnd
         abd.uCallbackMessage = WM_APPBAR
         abd.uEdge = ABE_TOP
-        abd.rc.left = phys_x
-        abd.rc.top = phys_y + max(0, prior_top_reserved)
-        abd.rc.right = phys_x + phys_width
-        abd.rc.bottom = abd.rc.top + phys_height
+        abd.rc.left = mi.rcMonitor.left
+        abd.rc.top = mi.rcMonitor.top
+        abd.rc.right = mi.rcMonitor.right
+        abd.rc.bottom = mi.rcMonitor.top + phys_height
 
         new_result = shell32.SHAppBarMessage(ABM_NEW, ctypes.byref(abd))
         if not new_result:
@@ -6749,93 +7122,59 @@ class NFLTicker(QtWidgets.QWidget):
             )
             return
         self._appbar_registered = True
-
-        shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd))
-        # Preserve our exact height from the (possibly adjusted) top.
-        abd.rc.bottom = abd.rc.top + phys_height
-        shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd))
-        user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
         print(
-            f"[AppBar] After SETPOS rcWork.top={mi.rcWork.top} "
-            f"strip=({abd.rc.left},{abd.rc.top},{abd.rc.right},{abd.rc.bottom})"
+            f"[AppBar] Registered — DPR={dpr}, phys height={phys_height}px, "
+            f"monitor top={mi.rcMonitor.top}, rcWork.top={mi.rcWork.top}"
         )
-
-        self._appbar_reserved_phys = (
-            int(abd.rc.left),
-            int(abd.rc.top),
-            int(abd.rc.right),
-            int(abd.rc.bottom),
-        )
-        self._appbar_hmonitor = hmonitor
-        self._appbar_stack_top_phys = int(abd.rc.top - phys_y)
-
-        # Physical SetWindowPos — Qt setGeometry remaps via primary DPI.
-        HWND_TOPMOST = -1
-        SWP_NOACTIVATE = 0x0010
-        self._parking_appbar_window = True
-        try:
-            user32.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                int(abd.rc.left),
-                int(abd.rc.top),
-                int(abd.rc.right - abd.rc.left),
-                int(abd.rc.bottom - abd.rc.top),
-                SWP_NOACTIVATE,
-            )
-        finally:
-            self._parking_appbar_window = False
-        wr = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(wr))
-        if wr.top != int(abd.rc.top):
-            print(
-                f"[AppBar] HWND snapped to y={wr.top}, re-parking at y={abd.rc.top}"
-            )
-            self._park_window_at_reserved()
-        shell32.SHAppBarMessage(ABM_WINDOWPOSCHANGED, ctypes.byref(abd))
-        shell32.SHAppBarMessage(ABM_ACTIVATE, ctypes.byref(abd))
-
-        self._appbar_on_primary = self._is_primary_monitor_handle(hmonitor)
-        # If the shell did not shrink the work area, force it (common with Tool windows).
-        self._force_work_area_below_strip(hmonitor, abd.rc.bottom)
-        self._notify_same_monitor_work_area_change()
+        self._refresh_appbar_geometry(notify_work_area=True, reason="register")
         self._schedule_workarea_rebroadcasts()
-
-        _logical_height = int((abd.rc.bottom - abd.rc.top) / max(dpr, 0.01))
-        print(
-            f"[AppBar] Registered — DPR={dpr}, "
-            f"monitor phys=({phys_x},{phys_y},{phys_x + phys_width},{mi.rcMonitor.bottom}), "
-            f"reserved phys=({abd.rc.left},{abd.rc.top},{abd.rc.right},{abd.rc.bottom}), "
-            f"window phys=({wr.left},{wr.top},{wr.right},{wr.bottom}), "
-            f"logical height={_logical_height}px"
-        )
 
     def remove_appbar(self):
         """Unregister AppBar and release reserved desktop space."""
         if sys.platform != "win32":
             return
-        if getattr(self, "_appbar_passive_dock", False):
-            self._appbar_passive_dock = False
-            self._appbar_reserved_phys = None
-            print("[AppBar] Passive dock released")
+        was_registered = getattr(self, "_appbar_registered", False)
+        was_passive = getattr(self, "_appbar_passive_dock", False)
+        if not was_registered and not was_passive:
             return
-        if not getattr(self, "_appbar_registered", False):
-            return
-        was_primary = getattr(self, "_appbar_on_primary", False)
+        # Cancel delayed work-area writes from the run that is ending.
+        self._workarea_broadcast_gen = getattr(self, "_workarea_broadcast_gen", 0) + 1
         hmonitor = getattr(self, "_appbar_hmonitor", None)
+        hwnd = int(self.winId()) if self.winId() else 0
+        if not hmonitor and hwnd:
+            hmonitor = ctypes.windll.user32.MonitorFromWindow(hwnd, 0x00000002)
+        # Docks that remain after we leave. Our own window is excluded, and
+        # rcWork is not consulted — it is the reservation we are releasing.
+        foreign = int(self._top_dock_inset_phys())
         self._appbar_registered = False
+        self._appbar_passive_dock = False
+        self._appbar_reserved_phys = None
+        self._appbar_stack_top_phys = 0
         try:
-            shell32 = ctypes.windll.shell32
-            abd = APPBARDATA()
-            abd.cbSize = ctypes.sizeof(APPBARDATA)
-            abd.hWnd = int(self.winId())
-            abd.uCallbackMessage = WM_APPBAR
-            shell32.SHAppBarMessage(ABM_REMOVE, ctypes.byref(abd))
-            self._appbar_reserved_phys = None
-            # Undo any forced SPI work-area inset: ask shell to republish.
-            if was_primary:
-                ctypes.windll.user32.SystemParametersInfoW(0x002F, 0, None, 0x01 | 0x02)
+            if was_registered:
+                shell32 = ctypes.windll.shell32
+                abd = APPBARDATA()
+                abd.cbSize = ctypes.sizeof(APPBARDATA)
+                abd.hWnd = int(self.winId())
+                abd.uCallbackMessage = WM_APPBAR
+                shell32.SHAppBarMessage(ABM_REMOVE, ctypes.byref(abd))
             if hmonitor:
+                class _MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", ctypes.c_uint32),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", ctypes.c_uint32),
+                    ]
+
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+                    # Explicit rect. SPI_SETWORKAREA(NULL) leaves the forced
+                    # inset in the registry, so the next start docks under it.
+                    self._force_work_area_below_strip(
+                        hmonitor, int(mi.rcMonitor.top) + foreign
+                    )
                 self._appbar_hmonitor = hmonitor
                 self._notify_same_monitor_work_area_change()
             print("[AppBar] Unregistered — desktop space released")
@@ -6847,6 +7186,7 @@ class NFLTicker(QtWidgets.QWidget):
         if sys.platform != "win32":
             return
         self._check_sister_appbar_layout()
+        self._sync_appbar_below_top_docks()
         try:
             user32 = ctypes.windll.user32
             fg_hwnd = user32.GetForegroundWindow()

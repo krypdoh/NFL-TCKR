@@ -6,7 +6,7 @@ Displays a scrolling top-of-screen bar with team logos, colored names, scores,
 down & distance, last play, QB stats, ball-on field position, and a possession
 football icon.
 
-**Version:** 0.1.47  
+**Version:** 0.1.52  
 **Data:** ESPN public site API ([Public-ESPN-API](https://github.com/pseudo-r/Public-ESPN-API))
 
 ---
@@ -28,10 +28,11 @@ Dependencies (already in the parent `requirements.txt`): `PyQt5`, `requests`.
 ### Desktop docking (Windows AppBar)
 
 With **Docked** enabled (default), the ticker registers as a top-edge AppBar so the
-desktop work area shrinks and other windows do not draw under it. If MLB-TCKR or
-another sister ticker already owns the top strip, NFL docks passively below it.
-Fullscreen games/video hide the ticker (opacity); it returns when fullscreen ends.
-Uncheck Docked in Settings for a floating always-on-top bar with no reservation.
+desktop work area shrinks and other windows do not draw under it. If another dock
+or a sister ticker already occupies the top, NFL stacks below that bar and reserves
+through the bottom of its own strip. Quitting or applying settings releases the
+strip. Fullscreen games/video hide the ticker (opacity); it returns when fullscreen
+ends. Uncheck Docked in Settings for a floating always-on-top bar with no reservation.
 
 ### Scroll smoothness debug
 
@@ -53,15 +54,20 @@ Console lines tagged `[SCROLL]`:
 | Action | How |
 |--------|-----|
 | Settings | Right-click tray / bar → Settings…, or press **S** |
-| Refresh | Tray → Refresh, or press **R** |
-| Pause | Hover the bar, or press **Space** |
+| Refresh | Tray → Refresh |
+| Pause / resume | **P** or **Space** (hover still pauses while the pointer is on the bar) |
+| Start scroll over | **T** |
+| Replay last scoring banner | **R** |
+| Center Follow Team | **F** (pauses; **F** or **P** resumes) |
+| Scroll speed | **+** faster, **−** slower |
 | Quit | Tray → Quit, or press **Q** |
 
 Settings are stored in `%APPDATA%\NFL-TCKR\NFL-TCKR.Settings.json`.
 
-- **General:** speed, refresh, height, docked AppBar, background/content transparency,
-  glow options, name display, filters, optional post-game PASS/RUSH/REC/SACKS/TACKLE
-  leaders after each final (with a chosen post-game stats font)
+- **General:** speed, refresh, height, docked AppBar, Follow Team, background/content
+  transparency, glow options, name display, filters, optional post-game
+  PASS/RUSH/REC/SACKS/TACKLE leaders after each final (with a chosen post-game stats font)
+- **Shortcuts:** keys that work while the ticker is focused
 - **Team Colors:** per-team Primary / Secondary / Tertiary / Custom (names + scoring flash)
 
 ## Layout (live games)

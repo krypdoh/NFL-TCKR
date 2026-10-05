@@ -1,6 +1,35 @@
 NFL-TCKR CHANGELOG
 ==================
 
+0.1.52 — 2026-10-04
+-------------------
+- Settings → Shortcuts lists the ticker keys. + and − change scroll speed.
+  Q still quits.
+- Settings → General: Follow Team. F centers that game and pauses; F or P
+  resumes.
+
+0.1.51 — 2026-10-04
+-------------------
+- Keys while the ticker is focused: P pause/resume, T start the scroll
+  from the beginning, R replay the last scoring banner
+
+0.1.50 — 2026-10-04
+-------------------
+- Dock: reserve the full on-screen strip and sit below other top docks
+  instead of covering them. Apply and quit release that strip, so the next
+  start no longer parks under the previous reservation.
+
+0.1.49 — 2026-09-30
+-------------------
+- Dock: keep checking the top of the monitor for another bar, not only other
+  tickers and not only at startup. NFL-TCKR stacks below that reservation.
+
+0.1.48 — 2026-09-30
+-------------------
+- Defaults: 64px bar, speed 10, 5s refresh, city names, team-name glow,
+  drive summary, post-game stats in Subway Ticker, and alternate colors for
+  Bills, Patriots, Browns, Steelers, Bears, Packers, Texans, Titans, Seahawks
+
 0.1.47 — 2026-09-29
 -------------------
 - Scroll: passer-line rotation on a final (and live) card stamps that line
