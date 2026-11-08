@@ -1,7 +1,7 @@
 """
 Author: Paul R. Charovkine <krypdoh@gmail.com>
 Program: NFL-TCKR.py
-Date: 2026.0927
+Date: 2026.1012
 Copyright: 2026 Paul R. Charovkine
 
 Description:
@@ -12,7 +12,7 @@ public site API. Integrates with Windows AppBar for docked desktop reservation
 (same model as MLB-TCKR).
 """
 
-VERSION = "0.1.52"
+VERSION = "0.1.57"
 
 import ctypes
 from ctypes import wintypes
@@ -138,6 +138,24 @@ NFL_COM_LOGO_PATH = os.path.join(LOGO_DIR, "nfl-com-logo.png")
 
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+ESPN_LEADERS = "https://site.api.espn.com/apis/site/v3/sports/football/nfl/leaders"
+_SEASON_LEADERS_CACHE = {"data": None, "fetched_at": 0.0}
+_SEASON_LEADERS_TTL_SEC = 15 * 60
+_LEADER_SHOW_OFF = "off"
+_LEADER_SHOW_LIVE = "during_live"
+_LEADER_SHOW_IDLE = "when_idle"
+_LEADER_SHOW_MODES = (_LEADER_SHOW_OFF, _LEADER_SHOW_LIVE, _LEADER_SHOW_IDLE)
+_LEADER_CATS = ("passing", "rushing", "receiving")
+_LEADER_CAT_ESPN = {
+    "passing": "passingYards",
+    "rushing": "rushingYards",
+    "receiving": "receivingYards",
+}
+_LEADER_CAT_LABEL = {
+    "passing": "PASSING",
+    "rushing": "RUSHING",
+    "receiving": "RECEIVING",
+}
 
 QB_ROTATE_MS = 5000
 QB_MIN_ATTEMPTS = 4  # proxy for "snaps" — ESPN boxscore has no snap count here
@@ -343,6 +361,17 @@ def get_settings():
         "postgame_font": "Subway Ticker",
         "include_scheduled_games": True,
         "live_games_only": False,
+        # League leaders (weekly from scoreboard; season from ESPN leaders API)
+        "weekly_leaders_mode": _LEADER_SHOW_OFF,
+        "weekly_leaders_top_n": 3,
+        "weekly_leaders_passing": True,
+        "weekly_leaders_rushing": True,
+        "weekly_leaders_receiving": True,
+        "season_leaders_mode": _LEADER_SHOW_OFF,
+        "season_leaders_top_n": 3,
+        "season_leaders_passing": True,
+        "season_leaders_rushing": True,
+        "season_leaders_receiving": True,
         "show_last_play": False,
         "show_drive_summary": True,
         "show_qb_stats": True,
@@ -354,6 +383,8 @@ def get_settings():
         "glow_team_names": True,  # soft glow behind team names (team color)
         "glow_all": False,  # glow behind all content; logos use faint white
         "monitor_index": 0,
+        "monitor_indexes": [0],
+        "display_mode": "single",  # single | clone | span
         "team_name_color_slot": 0,
         "team_colors": {
             "Bills": 1,
@@ -384,9 +415,112 @@ def get_settings():
     saved_font = str(defaults.get("font") or "").strip()
     if saved_font.lower() in _GENERIC_TICKER_FONTS:
         defaults["font"] = "Ozone"
+    _normalize_display_settings(defaults)
+    _normalize_leaders_settings(defaults)
     with _SETTINGS_LOCK:
         _SETTINGS_CACHE = defaults
         return _SETTINGS_CACHE
+
+
+def _normalize_display_settings(settings):
+    """Migrate monitor_index ↔ monitor_indexes and clamp display_mode."""
+    mode = str(settings.get("display_mode") or "single").strip().lower()
+    if mode not in ("single", "clone", "span"):
+        mode = "single"
+    settings["display_mode"] = mode
+
+    indexes = settings.get("monitor_indexes")
+    if not isinstance(indexes, (list, tuple)) or not indexes:
+        legacy = settings.get("monitor_index", 0)
+        try:
+            indexes = [int(legacy)]
+        except (TypeError, ValueError):
+            indexes = [0]
+    cleaned = []
+    seen = set()
+    for raw in indexes:
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx in seen:
+            continue
+        seen.add(idx)
+        cleaned.append(idx)
+    if not cleaned:
+        cleaned = [0]
+    if mode == "single":
+        cleaned = [cleaned[0]]
+    settings["monitor_indexes"] = cleaned
+    settings["monitor_index"] = cleaned[0]
+    return settings
+
+
+def _screen_label(screen, index):
+    """Human-readable label for a QScreen in settings UI."""
+    geo = screen.geometry()
+    name = (screen.name() or "").strip() or f"Display {index + 1}"
+    primary = QtWidgets.QApplication.primaryScreen()
+    tag = " — primary" if primary is not None and screen is primary else ""
+    return f"{name} — {geo.width()}×{geo.height()}{tag}"
+
+
+def _normalize_leaders_settings(settings):
+    """Clamp leader show modes, top-N, and category toggles."""
+    for prefix in ("weekly_leaders", "season_leaders"):
+        mode = str(settings.get(f"{prefix}_mode") or _LEADER_SHOW_OFF).strip().lower()
+        if mode not in _LEADER_SHOW_MODES:
+            # Accept a few aliases from older drafts / hand edits
+            if mode in ("none", "never", "hide", "disabled"):
+                mode = _LEADER_SHOW_OFF
+            elif mode in ("live", "during", "with_live"):
+                mode = _LEADER_SHOW_LIVE
+            elif mode in ("idle", "no_live", "when_idle_games", "between"):
+                mode = _LEADER_SHOW_IDLE
+            else:
+                mode = _LEADER_SHOW_OFF
+        settings[f"{prefix}_mode"] = mode
+        try:
+            n = int(settings.get(f"{prefix}_top_n", 3))
+        except (TypeError, ValueError):
+            n = 3
+        settings[f"{prefix}_top_n"] = max(1, min(5, n))
+        for cat in _LEADER_CATS:
+            key = f"{prefix}_{cat}"
+            settings[key] = bool(settings.get(key, True))
+    return settings
+
+
+def resolve_display_plan(settings):
+    """Return ordered [(screen, index, is_primary_bar), ...] for placement.
+
+    Screens are ordered left-to-right (then top-to-bottom) for span continuity.
+    The first entry hosts the primary NFLTicker bar; the rest are mirrors.
+    """
+    settings = _normalize_display_settings(dict(settings))
+    screens = list(QtWidgets.QApplication.screens() or [])
+    if not screens:
+        primary = QtWidgets.QApplication.primaryScreen()
+        if primary is None:
+            return []
+        return [(primary, 0, True)]
+
+    wanted = list(settings.get("monitor_indexes") or [0])
+    mode = settings.get("display_mode", "single")
+    picked = []
+    for idx in wanted:
+        if 0 <= idx < len(screens):
+            picked.append((screens[idx], idx))
+    if not picked:
+        picked = [(screens[0], 0)]
+    if mode == "single":
+        picked = [picked[0]]
+
+    picked.sort(key=lambda item: (item[0].geometry().x(), item[0].geometry().y(), item[1]))
+    plan = []
+    for i, (screen, idx) in enumerate(picked):
+        plan.append((screen, idx, i == 0))
+    return plan
 
 
 def save_settings(settings):
@@ -1172,6 +1306,8 @@ def _endpoint_label(url, params=None):
         label = "scoreboard"
     elif "summary" in url:
         label = "summary"
+    elif "leaders" in url:
+        label = "leaders"
     else:
         label = url.rsplit("/", 1)[-1] or url
     if params:
@@ -2124,7 +2260,11 @@ def _postgame_td_bit(td):
 
 
 def _parse_postgame_leaders(boxscore_players, team_id, abbr, team_full):
-    """Away/home crawl: PASS / RUSH / REC / SACKS / TACKLE leaders from boxscore."""
+    """Away/home crawl: PASS / RUSH / REC / SACKS / TACKLE leaders from boxscore.
+
+    Passing always includes TD and INT (including zero). Rushing and receiving
+    still omit a 0 TD.
+    """
     nick = get_team_nickname(team_full) or ""
     tag = (NFL_CITY_ABBR.get(nick) or abbr or nick or "TEAM").upper()
     block = _boxscore_block(boxscore_players, team_id, abbr)
@@ -2145,15 +2285,21 @@ def _parse_postgame_leaders(boxscore_players, team_id, abbr, team_full):
             if cmp_ and att:
                 catt = f"{cmp_}/{att}"
         yds = _stat_compact(_stat_at(stats, labels, keys, "YDS", "passingYards"))
-        td = _stat_compact(_stat_at(stats, labels, keys, "TD", "passingTouchdowns"))
+        td = _stat_compact(_stat_at(
+            stats, labels, keys, "TD", "passingTouchdowns",
+        )) or "0"
+        inter = _stat_compact(_stat_at(
+            stats, labels, keys, "INT", "interceptions", "passingInterceptions",
+        )) or "0"
         bits = []
         if catt:
             bits.append(catt)
         if yds:
             bits.append(f"{yds}YDS")
-        td_bit = _postgame_td_bit(td)
-        if td_bit:
-            bits.append(td_bit)
+        # Always show TD and INT for the passer, including zero, matching the
+        # under-name QB line (#16 Lawrence 20/33 182 YDS, 3 TD, 1 INT).
+        bits.append(f"{td}TD")
+        bits.append(f"{inter}INT")
         sections.append((f"{tag} PASS", _postgame_player_clause(passer, bits)))
 
     rushing = _boxscore_category(block, "rushing")
@@ -2995,13 +3141,271 @@ def advance_test_games(games, tick):
     return games
 
 
+def _empty_league_leaders():
+    return {
+        "week": None,
+        "season_year": None,
+        "weekly": {cat: [] for cat in _LEADER_CATS},
+        "season": {cat: [] for cat in _LEADER_CATS},
+    }
+
+
+def _leader_show_allowed(mode, has_live):
+    mode = str(mode or _LEADER_SHOW_OFF).strip().lower()
+    if mode == _LEADER_SHOW_LIVE:
+        return bool(has_live)
+    if mode == _LEADER_SHOW_IDLE:
+        return not bool(has_live)
+    return False
+
+
+def _leaders_wanted(settings):
+    """True if any leaders scope might be shown (fetch even when currently idle/live gated)."""
+    settings = settings or {}
+    for prefix in ("weekly_leaders", "season_leaders"):
+        mode = str(settings.get(f"{prefix}_mode") or _LEADER_SHOW_OFF)
+        if mode in (_LEADER_SHOW_LIVE, _LEADER_SHOW_IDLE):
+            if any(settings.get(f"{prefix}_{cat}", True) for cat in _LEADER_CATS):
+                return True
+    return False
+
+
+def _parse_yards_sort_value(display_value, fallback=0.0):
+    """Pull the primary yards number from ESPN leader display text."""
+    text = str(display_value or "")
+    m = re.search(r"([\d,]+)\s*YDS", text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    try:
+        return float(fallback)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _team_map_from_competitors(comp):
+    """Map ESPN team id → (abbr, full display name)."""
+    out = {}
+    for c in comp.get("competitors") or []:
+        team = c.get("team") or {}
+        tid = str(team.get("id") or c.get("id") or "")
+        if not tid:
+            continue
+        abbr = team.get("abbreviation") or ""
+        full = team.get("displayName") or team.get("name") or abbr
+        out[tid] = (abbr, full)
+    return out
+
+
+def _weekly_leaders_from_scoreboard(data, top_n=5):
+    """Aggregate per-game competition leaders into week top-N PASS/RUSH/REC."""
+    buckets = {cat: [] for cat in _LEADER_CATS}
+    events = data.get("events") or []
+    week = (data.get("week") or {}).get("number")
+    year = (data.get("season") or {}).get("year")
+    for e in events:
+        # Pregame "leaders" are season lines — skip them for weekly tops.
+        st = ((e.get("status") or {}).get("type") or {}).get("state")
+        if st not in ("in", "post"):
+            continue
+        comp = (e.get("competitions") or [{}])[0]
+        team_map = _team_map_from_competitors(comp)
+        for cat_block in comp.get("leaders") or []:
+            espn_name = (cat_block.get("name") or "").strip()
+            cat = None
+            for key, espn in _LEADER_CAT_ESPN.items():
+                if espn_name == espn:
+                    cat = key
+                    break
+            if not cat:
+                continue
+            for lead in cat_block.get("leaders") or []:
+                ath = lead.get("athlete") or {}
+                team_id = str(
+                    (lead.get("team") or {}).get("id")
+                    or (ath.get("team") or {}).get("id")
+                    or ""
+                )
+                abbr, full = team_map.get(team_id, ("", ""))
+                disp = lead.get("displayValue") or ""
+                sort_v = _parse_yards_sort_value(disp, lead.get("value"))
+                name = (
+                    ath.get("shortName")
+                    or ath.get("displayName")
+                    or ath.get("fullName")
+                    or "?"
+                )
+                buckets[cat].append(
+                    {
+                        "name": name,
+                        "team_abbr": abbr,
+                        "team_full": full,
+                        "line": disp,
+                        "sort_value": sort_v,
+                        "athlete_id": str(ath.get("id") or ""),
+                    }
+                )
+    # Dedupe by athlete (keep best yards), then take top_n
+    for cat in _LEADER_CATS:
+        best = {}
+        for row in buckets[cat]:
+            aid = row.get("athlete_id") or f"{row.get('name')}|{row.get('team_abbr')}"
+            prev = best.get(aid)
+            if prev is None or float(row.get("sort_value") or 0) > float(
+                prev.get("sort_value") or 0
+            ):
+                best[aid] = row
+        ranked = sorted(
+            best.values(), key=lambda r: float(r.get("sort_value") or 0), reverse=True
+        )[: max(1, int(top_n))]
+        for i, row in enumerate(ranked, start=1):
+            row["rank"] = i
+        buckets[cat] = ranked
+    return {"week": week, "season_year": year, "categories": buckets}
+
+
+def _season_leaders_from_api(top_n=5):
+    """Fetch ESPN season leaders (cached). Returns {cat: [rows...]}."""
+    now = time.time()
+    cached = _SEASON_LEADERS_CACHE.get("data")
+    if (
+        cached is not None
+        and (now - float(_SEASON_LEADERS_CACHE.get("fetched_at") or 0))
+        < _SEASON_LEADERS_TTL_SEC
+    ):
+        # Re-slice to requested top_n from cached full lists
+        out = {}
+        for cat in _LEADER_CATS:
+            rows = list((cached.get(cat) or [])[: max(1, int(top_n))])
+            for i, row in enumerate(rows, start=1):
+                row = dict(row)
+                row["rank"] = i
+                rows[i - 1] = row
+            out[cat] = rows
+        return out, cached.get("_meta") or {}
+
+    try:
+        data = _http_get(ESPN_LEADERS)
+    except Exception as e:
+        print(f"[ESPN] leaders fetch failed: {e}")
+        return {cat: [] for cat in _LEADER_CATS}, {}
+
+    req = data.get("requestedSeason") or data.get("currentSeason") or {}
+    meta = {
+        "season_year": req.get("year"),
+        "week": ((req.get("type") or {}).get("week") or {}).get("number"),
+    }
+    cats_json = ((data.get("leaders") or {}).get("categories")) or []
+    parsed = {cat: [] for cat in _LEADER_CATS}
+    for cat_block in cats_json:
+        espn_name = (cat_block.get("name") or "").strip()
+        cat = None
+        for key, espn in _LEADER_CAT_ESPN.items():
+            if espn_name == espn:
+                cat = key
+                break
+        if not cat:
+            continue
+        rows = []
+        for lead in (cat_block.get("leaders") or [])[:5]:
+            ath = lead.get("athlete") or {}
+            team = lead.get("team") or {}
+            abbr = team.get("abbreviation") or ""
+            full = team.get("displayName") or team.get("name") or abbr
+            disp = lead.get("displayValue") or ""
+            # Season API often returns bare yards; enrich label
+            try:
+                yds = int(float(lead.get("value") or _parse_yards_sort_value(disp)))
+            except (TypeError, ValueError):
+                yds = int(_parse_yards_sort_value(disp))
+            if disp and "YDS" not in disp.upper():
+                line = f"{yds} YDS"
+            else:
+                line = disp or f"{yds} YDS"
+            name = (
+                ath.get("shortName")
+                or ath.get("displayName")
+                or ath.get("fullName")
+                or "?"
+            )
+            rows.append(
+                {
+                    "name": name,
+                    "team_abbr": abbr,
+                    "team_full": full,
+                    "line": line,
+                    "sort_value": float(yds),
+                    "athlete_id": str(ath.get("id") or ""),
+                }
+            )
+        parsed[cat] = rows
+
+    store = {cat: list(rows) for cat, rows in parsed.items()}
+    store["_meta"] = meta
+    _SEASON_LEADERS_CACHE["data"] = store
+    _SEASON_LEADERS_CACHE["fetched_at"] = now
+
+    out = {}
+    for cat in _LEADER_CATS:
+        rows = list((parsed.get(cat) or [])[: max(1, int(top_n))])
+        for i, row in enumerate(rows, start=1):
+            row = dict(row)
+            row["rank"] = i
+            rows[i - 1] = row
+        out[cat] = rows
+    return out, meta
+
+
+def _build_league_leaders(settings, scoreboard_data):
+    """Build weekly + season leader tables according to settings."""
+    settings = _normalize_leaders_settings(dict(settings or {}))
+    result = _empty_league_leaders()
+    if scoreboard_data:
+        result["week"] = (scoreboard_data.get("week") or {}).get("number")
+        result["season_year"] = (scoreboard_data.get("season") or {}).get("year")
+
+    if not _leaders_wanted(settings):
+        return result
+
+    weekly_mode = settings.get("weekly_leaders_mode")
+    if weekly_mode in (_LEADER_SHOW_LIVE, _LEADER_SHOW_IDLE) and scoreboard_data:
+        top_n = int(settings.get("weekly_leaders_top_n", 3))
+        weekly = _weekly_leaders_from_scoreboard(scoreboard_data, top_n=5)
+        result["week"] = weekly.get("week") or result["week"]
+        result["season_year"] = weekly.get("season_year") or result["season_year"]
+        for cat in _LEADER_CATS:
+            if settings.get(f"weekly_leaders_{cat}", True):
+                result["weekly"][cat] = list(
+                    (weekly.get("categories") or {}).get(cat) or []
+                )[:top_n]
+
+    season_mode = settings.get("season_leaders_mode")
+    if season_mode in (_LEADER_SHOW_LIVE, _LEADER_SHOW_IDLE):
+        top_n = int(settings.get("season_leaders_top_n", 3))
+        season_rows, meta = _season_leaders_from_api(top_n=5)
+        if meta.get("season_year") and not result["season_year"]:
+            result["season_year"] = meta.get("season_year")
+        if meta.get("week") and not result["week"]:
+            result["week"] = meta.get("week")
+        for cat in _LEADER_CATS:
+            if settings.get(f"season_leaders_{cat}", True):
+                result["season"][cat] = list(season_rows.get(cat) or [])[:top_n]
+    return result
+
+
 def fetch_nfl_games(settings=None):
-    """Fetch scoreboard; enrich in-progress (and finals) with summary for QB/last play."""
+    """Fetch scoreboard; enrich in-progress (and finals) with summary for QB/last play.
+
+    Returns (games, league_leaders).
+    """
     settings = settings or get_settings()
     data = _http_get(ESPN_SCOREBOARD)
     events = data.get("events") or []
     if not events:
-        return []
+        leaders = _build_league_leaders(settings, data if isinstance(data, dict) else {})
+        return [], leaders
 
     # Live games need a fresh summary every poll (QB line, last play).
     # Finals are fetched once and reused. Scheduled games stay on the scoreboard.
@@ -3054,10 +3458,11 @@ def fetch_nfl_games(settings=None):
             _dbg(f"parsed {_abbrev_game(g)}")
 
     # Filter by settings
+    leaders = _build_league_leaders(settings, data)
     live = [g for g in games if g["state"] == "in"]
     if settings.get("live_games_only") and live:
         _dbg(f"slate: live_only → {len(live)} game(s)")
-        return live
+        return live, leaders
     out = []
     for g in games:
         if g["state"] == "in":
@@ -3072,7 +3477,7 @@ def fetch_nfl_games(settings=None):
         f"in={sum(1 for g in out if g['state']=='in')} "
         f"post={sum(1 for g in out if g['state']=='post')})"
     )
-    return out
+    return out, leaders
 
 
 # ---------------------------------------------------------------------------
@@ -3484,8 +3889,57 @@ def _postgame_visual_key(game, side):
     )
 
 
-def _strip_card_jobs(games, qb_rotate_index, settings):
-    """Scroll order: each game card, then away/home post-game stats for finals."""
+def _leaders_card_payload(scope, category, rows, week=None, season_year=None):
+    """Build a crawl card dict for weekly/season PASS/RUSH/REC leaders."""
+    label = _LEADER_CAT_LABEL.get(category, category.upper())
+    if scope == "weekly":
+        week_txt = f"WEEK {week} " if week else "WEEKLY "
+        title = f"{week_txt}{label} LEADERS"
+    else:
+        year_txt = f"{season_year} " if season_year else ""
+        title = f"{year_txt}SEASON {label} LEADERS"
+    sections = []
+    for row in rows or []:
+        rank = row.get("rank") or ""
+        name = row.get("name") or "?"
+        abbr = row.get("team_abbr") or ""
+        line = row.get("line") or ""
+        who = f"{name} {abbr}".strip() if abbr else name
+        body = f"{who}, {line}" if line else who
+        sections.append((f"{rank}.", body))
+    accent = ""
+    if rows:
+        accent = rows[0].get("team_full") or ""
+    return {
+        "scope": scope,
+        "category": category,
+        "title": title,
+        "sections": sections,
+        "accent_team_full": accent,
+        "fingerprint": tuple(
+            (
+                row.get("rank"),
+                row.get("athlete_id") or row.get("name"),
+                row.get("line"),
+                row.get("team_abbr"),
+            )
+            for row in (rows or [])
+        ),
+    }
+
+
+def _leaders_visual_key(card):
+    return (
+        "leaders",
+        card.get("scope"),
+        card.get("category"),
+        card.get("title"),
+        card.get("fingerprint"),
+    )
+
+
+def _strip_card_jobs(games, qb_rotate_index, settings, league_leaders=None):
+    """Scroll order: games (+ post-game), then weekly/season league leaders."""
     jobs = []
     want_post = bool(settings.get("include_postgame_stats", False))
     for g in games or []:
@@ -3497,22 +3951,36 @@ def _strip_card_jobs(games, qb_rotate_index, settings):
             if not (stats.get("sections") or []):
                 continue
             jobs.append((_postgame_visual_key(g, side), "post", g, side))
+
+    leaders = league_leaders or {}
+    has_live = any((g.get("state") == "in") for g in (games or []))
+    week = leaders.get("week")
+    year = leaders.get("season_year")
+    for scope, prefix in (("weekly", "weekly_leaders"), ("season", "season_leaders")):
+        mode = settings.get(f"{prefix}_mode", _LEADER_SHOW_OFF)
+        if not _leader_show_allowed(mode, has_live):
+            continue
+        top_n = max(1, min(5, int(settings.get(f"{prefix}_top_n", 3) or 3)))
+        bucket = leaders.get(scope) or {}
+        for cat in _LEADER_CATS:
+            if not settings.get(f"{prefix}_{cat}", True):
+                continue
+            rows = list(bucket.get(cat) or [])[:top_n]
+            if not rows:
+                continue
+            card = _leaders_card_payload(scope, cat, rows, week=week, season_year=year)
+            jobs.append((_leaders_visual_key(card), "leaders", card, None))
     return jobs
 
 
-def build_postgame_stats_card(host, game, side):
-    """One-line crawl: TEAM PASS / RUSH / REC / SACKS / TACKLE; headers in team color."""
+def _paint_crawl_card(host, sections, accent_team_full=""):
+    """Shared one-line header/body crawl used by post-game and league leaders."""
     settings = host.settings
     h = host.ticker_height
     dpr = host.dpr
-    stats = game.get(f"{side}_post") or {}
-    sections = stats.get("sections") or []
-    team_full = (
-        stats.get("team_full")
-        or (game.get("away_name") if side == "away" else game.get("home_name"))
-        or ""
-    )
-    team_color = QtGui.QColor(get_team_color(team_full, settings))
+    team_color = QtGui.QColor(get_team_color(accent_team_full or "", settings))
+    if not accent_team_full:
+        team_color = QtGui.QColor("#FFD700")
     glow_names = bool(settings.get("glow_team_names", False))
     glow_all = bool(settings.get("glow_all", False))
 
@@ -3525,7 +3993,7 @@ def build_postgame_stats_card(host, game, side):
     body_color = QtGui.QColor("#FFFFFF")
     gap = "  "
     runs = []
-    for i, section in enumerate(sections):
+    for i, section in enumerate(sections or []):
         if not section or len(section) < 2:
             continue
         header, body = section[0], section[1]
@@ -3569,6 +4037,36 @@ def build_postgame_stats_card(host, game, side):
     painter.end()
     time.sleep(0)
     return image
+
+
+def build_postgame_stats_card(host, game, side):
+    """One-line crawl: TEAM PASS / RUSH / REC / SACKS / TACKLE; headers in team color."""
+    stats = game.get(f"{side}_post") or {}
+    sections = stats.get("sections") or []
+    team_full = (
+        stats.get("team_full")
+        or (game.get("away_name") if side == "away" else game.get("home_name"))
+        or ""
+    )
+    return _paint_crawl_card(host, sections, accent_team_full=team_full)
+
+
+def build_league_leaders_card(host, card):
+    """One-line crawl: WEEKLY/SEASON PASSING|RUSHING|RECEIVING LEADERS."""
+    title = card.get("title") or "LEADERS"
+    bits = []
+    for section in card.get("sections") or []:
+        if not section or len(section) < 2:
+            continue
+        header, body = section[0], section[1]
+        bit = f"{header} {body}".strip() if header else (body or "").strip()
+        if bit:
+            bits.append(bit)
+    return _paint_crawl_card(
+        host,
+        [(title, "  ".join(bits))],
+        accent_team_full=card.get("accent_team_full") or "",
+    )
 
 
 def build_game_card(host, game, qb_rotate_index=0, layer="full", target=None):
@@ -4250,6 +4748,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._create_general_tab(), "General")
+        self.tabs.addTab(self._create_leaders_tab(), "Leaders")
         self.tabs.addTab(self._create_shortcuts_tab(), "Shortcuts")
         self.tabs.addTab(self._create_team_colors_tab(), "Team Colors")
         self.tabs.addTab(self._create_network_tab(), "Network")
@@ -4291,6 +4790,50 @@ class SettingsDialog(QtWidgets.QDialog):
             "always-on-top ticker (no desktop reservation)."
         )
         layout.addRow(self.docked)
+
+        self.display_mode = QtWidgets.QComboBox()
+        self.display_mode.addItem("Single display", "single")
+        self.display_mode.addItem("Clone on each selected", "clone")
+        self.display_mode.addItem("Continuous span across selected", "span")
+        saved_mode = str(settings.get("display_mode") or "single").strip().lower()
+        mode_idx = self.display_mode.findData(saved_mode)
+        self.display_mode.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self.display_mode.setToolTip(
+            "Single: one bar on one display.\n"
+            "Clone: identical bars on every checked display.\n"
+            "Span: one continuous scroll path left-to-right across checked displays."
+        )
+        layout.addRow("Display placement:", self.display_mode)
+
+        screens = list(QtWidgets.QApplication.screens() or [])
+        selected = set()
+        for raw in settings.get("monitor_indexes") or [settings.get("monitor_index", 0)]:
+            try:
+                selected.add(int(raw))
+            except (TypeError, ValueError):
+                pass
+        if not selected:
+            selected = {0}
+        if saved_mode == "single":
+            selected = {min(selected)}
+
+        self._display_checks = []
+        display_box = QtWidgets.QWidget()
+        display_col = QtWidgets.QVBoxLayout(display_box)
+        display_col.setContentsMargins(0, 0, 0, 0)
+        display_col.setSpacing(4)
+        if not screens:
+            display_col.addWidget(QtWidgets.QLabel("No displays detected."))
+        for i, screen in enumerate(screens):
+            cb = QtWidgets.QCheckBox(_screen_label(screen, i))
+            cb.setChecked(i in selected)
+            cb.setProperty("monitor_index", i)
+            cb.toggled.connect(self._on_display_check_toggled)
+            self._display_checks.append(cb)
+            display_col.addWidget(cb)
+        layout.addRow("Displays:", display_box)
+        self.display_mode.currentIndexChanged.connect(self._on_display_mode_changed)
+        self._sync_display_checks_for_mode()
 
         self.follow_team = QtWidgets.QComboBox()
         self.follow_team.addItem("(none)", "")
@@ -4445,6 +4988,65 @@ class SettingsDialog(QtWidgets.QDialog):
 
         return widget
 
+    def _leaders_mode_combo(self, saved_mode):
+        combo = QtWidgets.QComboBox()
+        combo.addItem("Do not show", _LEADER_SHOW_OFF)
+        combo.addItem("Show during live games", _LEADER_SHOW_LIVE)
+        combo.addItem("Show when no live games are running", _LEADER_SHOW_IDLE)
+        idx = combo.findData(str(saved_mode or _LEADER_SHOW_OFF))
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        return combo
+
+    def _create_leaders_tab(self):
+        """Weekly + season PASS/RUSH/REC league leaders."""
+        widget = QtWidgets.QWidget()
+        root = QtWidgets.QVBoxLayout(widget)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+        settings = self.settings
+        _normalize_leaders_settings(settings)
+
+        note = QtWidgets.QLabel(
+            "League leaders appear after the game cards on the ticker. "
+            "Weekly leaders are taken from this week's scoreboard; season "
+            "leaders come from ESPN season stats."
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        def _scope_group(title, prefix):
+            box = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(box)
+            mode = self._leaders_mode_combo(settings.get(f"{prefix}_mode"))
+            setattr(self, f"{prefix}_mode", mode)
+            form.addRow("Show:", mode)
+
+            top_n = QtWidgets.QSpinBox()
+            top_n.setRange(1, 5)
+            top_n.setValue(int(settings.get(f"{prefix}_top_n", 3)))
+            top_n.setToolTip("How many top players to list for each category")
+            setattr(self, f"{prefix}_top_n", top_n)
+            form.addRow("Top players:", top_n)
+
+            cats = QtWidgets.QHBoxLayout()
+            for cat, label in (
+                ("passing", "Passing"),
+                ("rushing", "Rushing"),
+                ("receiving", "Receiving"),
+            ):
+                cb = QtWidgets.QCheckBox(label)
+                cb.setChecked(bool(settings.get(f"{prefix}_{cat}", True)))
+                setattr(self, f"{prefix}_{cat}", cb)
+                cats.addWidget(cb)
+            cats.addStretch(1)
+            form.addRow("Categories:", cats)
+            return box
+
+        root.addWidget(_scope_group("Weekly leaders", "weekly_leaders"))
+        root.addWidget(_scope_group("Season leaders", "season_leaders"))
+        root.addStretch(1)
+        return widget
+
     def _create_shortcuts_tab(self):
         """Read-only list of keys that work while the ticker is focused."""
         widget = QtWidgets.QWidget()
@@ -4463,6 +5065,7 @@ class SettingsDialog(QtWidgets.QDialog):
             ("T", "Start the scroll from the beginning"),
             ("R", "Replay the last scoring banner"),
             ("F", "Center the Follow Team game and pause. F or P resumes."),
+            ("L", "Jump to Leaders on the ticker (no-op if Leaders are not showing)"),
             ("+", "Increase scroll speed"),
             ("−", "Decrease scroll speed"),
             ("S", "Open settings"),
@@ -4740,6 +5343,58 @@ class SettingsDialog(QtWidgets.QDialog):
         if path:
             self.cert_file_edit.setText(path)
 
+    def _on_display_mode_changed(self, _index=None):
+        self._sync_display_checks_for_mode()
+
+    def _on_display_check_toggled(self, checked):
+        mode = self.display_mode.currentData() or "single"
+        sender = self.sender()
+        if mode == "single" and checked:
+            for cb in self._display_checks:
+                if cb is not sender and cb.isChecked():
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+        # Keep at least one display selected
+        if not any(cb.isChecked() for cb in self._display_checks):
+            fallback = sender if sender is not None else (
+                self._display_checks[0] if self._display_checks else None
+            )
+            if fallback is not None:
+                fallback.blockSignals(True)
+                fallback.setChecked(True)
+                fallback.blockSignals(False)
+
+    def _sync_display_checks_for_mode(self):
+        mode = self.display_mode.currentData() or "single"
+        checked = [cb for cb in self._display_checks if cb.isChecked()]
+        if mode == "single":
+            keep = checked[0] if checked else (
+                self._display_checks[0] if self._display_checks else None
+            )
+            for cb in self._display_checks:
+                want = cb is keep
+                if cb.isChecked() != want:
+                    cb.blockSignals(True)
+                    cb.setChecked(want)
+                    cb.blockSignals(False)
+        elif not checked and self._display_checks:
+            self._display_checks[0].blockSignals(True)
+            self._display_checks[0].setChecked(True)
+            self._display_checks[0].blockSignals(False)
+
+    def _selected_monitor_indexes(self):
+        indexes = []
+        for cb in getattr(self, "_display_checks", []):
+            if cb.isChecked():
+                indexes.append(int(cb.property("monitor_index")))
+        if not indexes:
+            indexes = [0]
+        mode = self.display_mode.currentData() or "single"
+        if mode == "single":
+            indexes = [indexes[0]]
+        return indexes
+
     def apply(self):
         s = self.settings
         s["speed"] = self.speed.value()
@@ -4747,6 +5402,10 @@ class SettingsDialog(QtWidgets.QDialog):
         s["ticker_height"] = self.height.value()
         s["font"] = self.font_combo.currentText().strip() or "Ozone"
         s["docked"] = self.docked.isChecked()
+        s["display_mode"] = self.display_mode.currentData() or "single"
+        s["monitor_indexes"] = self._selected_monitor_indexes()
+        s["monitor_index"] = s["monitor_indexes"][0]
+        _normalize_display_settings(s)
         s["follow_team"] = self.follow_team.currentData() or ""
         # Invert UI transparency % → stored alpha (0=clear, 255=opaque)
         s["background_opacity"] = int(
@@ -4773,6 +5432,12 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         s["include_scheduled_games"] = self.scheduled.isChecked()
         s["live_games_only"] = self.live_only.isChecked()
+        for prefix in ("weekly_leaders", "season_leaders"):
+            s[f"{prefix}_mode"] = getattr(self, f"{prefix}_mode").currentData() or _LEADER_SHOW_OFF
+            s[f"{prefix}_top_n"] = getattr(self, f"{prefix}_top_n").value()
+            for cat in _LEADER_CATS:
+                s[f"{prefix}_{cat}"] = getattr(self, f"{prefix}_{cat}").isChecked()
+        _normalize_leaders_settings(s)
         s["use_proxy"] = self.use_proxy_check.isChecked()
         s["proxy"] = self.proxy_url_edit.text().strip()
         s["use_cert"] = self.use_cert_check.isChecked()
@@ -4814,15 +5479,25 @@ def _layout_tuple(settings, height, dpr):
         bool(s.get("show_team_cities", False)),
         bool(s.get("include_postgame_stats", False)),
         s.get("postgame_font", "Gotham Black"),
+        s.get("weekly_leaders_mode", _LEADER_SHOW_OFF),
+        int(s.get("weekly_leaders_top_n", 3) or 3),
+        bool(s.get("weekly_leaders_passing", True)),
+        bool(s.get("weekly_leaders_rushing", True)),
+        bool(s.get("weekly_leaders_receiving", True)),
+        s.get("season_leaders_mode", _LEADER_SHOW_OFF),
+        int(s.get("season_leaders_top_n", 3) or 3),
+        bool(s.get("season_leaders_passing", True)),
+        bool(s.get("season_leaders_rushing", True)),
+        bool(s.get("season_leaders_receiving", True)),
         round(float(dpr), 3),
     )
 
 
-def _slate_fp(settings, games, qb_index, height, dpr):
+def _slate_fp(settings, games, qb_index, height, dpr, league_leaders=None):
     layout = _layout_tuple(settings, height, dpr)
-    if not games:
+    jobs = _strip_card_jobs(games, qb_index, settings, league_leaders=league_leaders)
+    if not jobs:
         return ("empty", layout)
-    jobs = _strip_card_jobs(games, qb_index, settings)
     return (
         tuple(job[0] for job in jobs),
         layout,
@@ -4901,15 +5576,25 @@ def _render_strip(host, games):
         cards = [img]
     else:
         for _key, kind, game, side in _strip_card_jobs(
-            games, host.qb_rotate_index, host.settings
+            games,
+            host.qb_rotate_index,
+            host.settings,
+            league_leaders=getattr(host, "_league_leaders", None),
         ):
             try:
                 if kind == "post":
                     cards.append(build_postgame_stats_card(host, game, side))
+                elif kind == "leaders":
+                    cards.append(build_league_leaders_card(host, game))
                 else:
                     cards.append(build_game_card(host, game, host.qb_rotate_index))
             except Exception as e:
-                print(f"[CARD] {game.get('game_id')}: {e}")
+                label = (
+                    game.get("title")
+                    if kind == "leaders"
+                    else game.get("game_id")
+                )
+                print(f"[CARD] {label}: {e}")
     return _compose_strip_image(cards, host.settings, host.ticker_height, host.dpr)
 
 
@@ -4956,6 +5641,206 @@ class _FontHost:
 
 
 # ---------------------------------------------------------------------------
+# Mirror bar (extra monitors — paints from the primary NFLTicker)
+# ---------------------------------------------------------------------------
+class TickerMirror(QtWidgets.QWidget):
+    """Lightweight per-monitor bar that mirrors the primary ticker strip."""
+
+    def __init__(self, owner, screen, span_origin_x=0.0):
+        super().__init__()
+        self.owner = owner
+        self.settings = owner.settings
+        self._screen = screen
+        self._target_screen = screen
+        self.span_origin_x = float(span_origin_x)
+        self.dpr = float(screen.devicePixelRatio()) if screen else 1.0
+        self.ticker_height = int(owner.settings.get("ticker_height", 72))
+        self.cached_background = None
+        self._cached_bg_key = None
+
+        # AppBar state (methods borrowed from NFLTicker after class body)
+        self._appbar_registered = False
+        self._appbar_passive_dock = False
+        self._appbar_reserved_phys = None
+        self._appbar_hmonitor = None
+        self._appbar_on_primary = True
+        self._appbar_stack_top_phys = 0
+        self._sister_gone_streak = 0
+        self._dock_clear_streak = 0
+        self._force_shell_appbar = False
+        self._appbar_init_done = False
+        self._parking_appbar_window = False
+        self._ticker_hidden_for_fullscreen = False
+        self._fullscreen_override_exes = owner._fullscreen_override_exes
+        self._workarea_broadcast_gen = 0
+
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setWindowTitle("NFL-TCKR")
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda pos: owner._context_menu(self.mapToGlobal(pos))
+        )
+
+        geo = screen.geometry()
+        self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
+
+        self._fullscreen_timer = QtCore.QTimer(self)
+        self._fullscreen_timer.timeout.connect(self._check_fullscreen)
+        self._fullscreen_timer.setInterval(2000)
+
+    def effective_scroll_offset(self):
+        """Scroll offset for this viewport (clone = same; span = +prior widths)."""
+        base = float(self.owner.scroll_offset)
+        mode = self.owner.settings.get("display_mode", "single")
+        if mode == "span":
+            return base + self.span_origin_x
+        return base
+
+    def rebind_screen(self, screen, span_origin_x, height):
+        self._screen = screen
+        self._target_screen = screen
+        self.span_origin_x = float(span_origin_x)
+        self.dpr = float(screen.devicePixelRatio()) if screen else 1.0
+        self.ticker_height = int(height)
+        self.cached_background = None
+        self._cached_bg_key = None
+        geo = screen.geometry()
+        self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_appbar_init_done", False):
+            self._appbar_init_done = True
+            if self.settings.get("docked", True):
+                QtCore.QTimer.singleShot(100, self.setup_appbar)
+                QtCore.QTimer.singleShot(500, self._ensure_appbar_registered)
+                QtCore.QTimer.singleShot(700, self._sync_appbar_below_top_docks)
+                QtCore.QTimer.singleShot(1800, self._sync_appbar_below_top_docks)
+            if not self._fullscreen_timer.isActive():
+                self._fullscreen_timer.start()
+
+    def closeEvent(self, event):
+        if hasattr(self, "_fullscreen_timer"):
+            self._fullscreen_timer.stop()
+        self.remove_appbar()
+        event.accept()
+
+    def enterEvent(self, event):
+        if not self.owner._key_paused:
+            self.owner.paused = True
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.owner.paused = self.owner._key_paused
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        self.owner.keyPressEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        """Handle AppBar notifications on this mirror's HWND."""
+        if sys.platform == "win32":
+            et = eventType
+            if isinstance(et, bytes):
+                et = et.decode("ascii", errors="ignore")
+            if et == "windows_generic_MSG":
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == WM_APPBAR and msg.wParam == ABN_POSCHANGED:
+                    if getattr(self, "_appbar_registered", False) and not getattr(
+                        self, "_appbar_passive_dock", False
+                    ):
+                        QtCore.QTimer.singleShot(
+                            0,
+                            lambda: self._refresh_appbar_geometry(
+                                notify_work_area=False, reason="ABN_POSCHANGED"
+                            ),
+                        )
+                    return True, 0
+        return QtWidgets.QWidget.nativeEvent(self, eventType, message)
+
+    def moveEvent(self, event):
+        QtWidgets.QWidget.moveEvent(self, event)
+        if getattr(self, "_parking_appbar_window", False):
+            return
+        if not self.settings.get("docked", True):
+            return
+        if getattr(self, "_appbar_reserved_phys", None):
+            self._park_window_at_reserved()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        w, h = self.width(), self.height()
+        owner = self.owner
+
+        if owner._current_alert is not None:
+            now = owner._elapsed.nsecsElapsed() / 1_000_000.0
+            phase_elapsed = now - owner._alert_phase_start
+            owner._render_scoring_alert(
+                painter, owner._alert_phase, phase_elapsed, w=w, h=h
+            )
+            painter.end()
+            return
+
+        opacity = int(owner.settings.get("background_opacity", 230))
+        led = bool(owner.settings.get("led_background", True))
+        bg_key = (led, opacity, w, h, VERSION)
+        if self._cached_bg_key != bg_key or self.cached_background is None:
+            self.cached_background = QtGui.QPixmap(w, h)
+            self.cached_background.fill(QtCore.Qt.transparent)
+            bg = QtGui.QPainter(self.cached_background)
+            bg.fillRect(0, 0, w, h, QtGui.QColor(0, 0, 0, opacity))
+            if led:
+                bg.setPen(QtGui.QColor(20, 40, 20, 80))
+                for y in range(0, h, 3):
+                    bg.drawLine(0, y, w, y)
+            bg.setPen(QtGui.QColor(80, 80, 80, 120))
+            bg.setFont(owner.tiny_font)
+            bg.drawText(6, h - 4, f"NFL-TCKR {VERSION}")
+            bg.end()
+            self._cached_bg_key = bg_key
+        painter.drawPixmap(0, 0, self.cached_background)
+
+        if owner._intro_hold:
+            owner._draw_intro_title(painter, w, h)
+            painter.end()
+            return
+
+        if owner._scroll_entries and owner._strip_w > 0:
+            content_alpha = (
+                max(0, min(255, int(owner.settings.get("content_opacity", 255)))) / 255.0
+            )
+            painter.setOpacity(content_alpha)
+            _smooth = self.dpr < 2.0
+            if _smooth:
+                painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            offset = self.effective_scroll_offset()
+            period = owner._strip_w
+            gap = owner._card_gap
+            view_w = w
+            for lap in (0.0, period):
+                x = lap - offset
+                for img, cw in owner._scroll_entries:
+                    if x + cw > 0 and x < view_w:
+                        painter.drawImage(QtCore.QRectF(x, 0, cw, h), img)
+                    x += cw + gap
+                    if x >= view_w:
+                        break
+            if _smooth:
+                painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
+            painter.setOpacity(1.0)
+
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
 # Ticker window
 # ---------------------------------------------------------------------------
 class NFLTicker(QtWidgets.QWidget):
@@ -4966,7 +5851,10 @@ class NFLTicker(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.settings = get_settings()
+        _normalize_display_settings(self.settings)
+        _normalize_leaders_settings(self.settings)
         self.games = []
+        self._league_leaders = _empty_league_leaders()
         self.card_images = []
         self.scroll_offset = 0.0  # float for sub-pixel scroll (MLB pattern)
         self._intro_hold = not _cli_faststart
@@ -5004,6 +5892,8 @@ class NFLTicker(QtWidgets.QWidget):
         self._card_cache_layout = None
         self.cached_background = None
         self._cached_bg_key = None
+        self._mirrors = []
+        self._span_origin_x = 0.0  # primary offset into virtual span (usually 0)
 
         # AppBar / desktop reservation (MLB-TCKR path)
         self._appbar_registered = False
@@ -5051,14 +5941,17 @@ class NFLTicker(QtWidgets.QWidget):
             lambda pos: self._context_menu(self.mapToGlobal(pos))
         )
 
-        screens = QtWidgets.QApplication.screens()
-        mon = min(int(self.settings.get("monitor_index", 0)), max(0, len(screens) - 1))
-        self._screen = screens[mon]
-        self._target_screen = self._screen  # alias used by AppBar helpers
-        geo = self._screen.geometry()
-        self.dpr = float(self._screen.devicePixelRatio())
         self.ticker_height = int(self.settings.get("ticker_height", 72))
-        self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
+        plan = resolve_display_plan(self.settings)
+        if plan:
+            self._screen = plan[0][0]
+        else:
+            self._screen = QtWidgets.QApplication.primaryScreen()
+        self._target_screen = self._screen  # alias used by AppBar helpers
+        self.dpr = float(self._screen.devicePixelRatio()) if self._screen else 1.0
+        if self._screen is not None:
+            geo = self._screen.geometry()
+            self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
 
         self._fullscreen_timer = QtCore.QTimer(self)
         self._fullscreen_timer.timeout.connect(self._check_fullscreen)
@@ -5152,6 +6045,100 @@ class NFLTicker(QtWidgets.QWidget):
             self._test_timer.start(TEST_ADVANCE_MS)
         else:
             self.refresh_games()
+
+        # Extra monitors after fonts/tray exist (mirrors paint with owner fonts).
+        self._apply_display_plan(show_mirrors=False)
+
+    def _destroy_mirrors(self):
+        for mirror in list(getattr(self, "_mirrors", []) or []):
+            try:
+                mirror.hide()
+                mirror.remove_appbar()
+                mirror.close()
+                mirror.deleteLater()
+            except Exception:
+                pass
+        self._mirrors = []
+
+    def _apply_display_plan(self, show_mirrors=True):
+        """Place primary + mirrors from display_mode / monitor_indexes."""
+        _normalize_display_settings(self.settings)
+        plan = resolve_display_plan(self.settings)
+        height = int(self.settings.get("ticker_height", 72))
+        self.ticker_height = height
+
+        # Tear down existing AppBars before moving windows.
+        self.remove_appbar()
+        self._destroy_mirrors()
+
+        if not plan:
+            self._appbar_init_done = False
+            return
+
+        # Cumulative widths for span continuity (left → right).
+        origins = []
+        running = 0.0
+        for screen, _idx, _is_primary in plan:
+            origins.append(running)
+            running += float(screen.geometry().width())
+
+        primary_screen, primary_idx, _ = plan[0]
+        self._screen = primary_screen
+        self._target_screen = primary_screen
+        self.dpr = float(primary_screen.devicePixelRatio())
+        self._span_origin_x = origins[0]
+        geo = primary_screen.geometry()
+        self.setGeometry(geo.x(), geo.y(), geo.width(), height)
+
+        mode = self.settings.get("display_mode", "single")
+        for i, (screen, idx, is_primary) in enumerate(plan):
+            if is_primary:
+                continue
+            mirror = TickerMirror(self, screen, span_origin_x=origins[i])
+            mirror.ticker_height = height
+            mirror._fullscreen_override_exes = self._fullscreen_override_exes
+            self._mirrors.append(mirror)
+            if show_mirrors:
+                mirror.show()
+
+        labels = ", ".join(
+            f"{idx}@{screen.geometry().width()}px" for screen, idx, _ in plan
+        )
+        print(
+            f"[TICKER] Display plan mode={mode} primary={primary_idx} "
+            f"monitors=[{labels}] mirrors={len(self._mirrors)}"
+        )
+
+        # If already visible (settings Apply), re-dock here. First show still
+        # goes through showEvent so leave _appbar_init_done False until then.
+        if self.isVisible():
+            self._appbar_init_done = True
+            if self.settings.get("docked", True):
+                QtCore.QTimer.singleShot(100, self.setup_appbar)
+                QtCore.QTimer.singleShot(500, self._ensure_appbar_registered)
+                QtCore.QTimer.singleShot(700, self._sync_appbar_below_top_docks)
+            for mirror in self._mirrors:
+                # Fresh mirrors run their own showEvent AppBar path.
+                if mirror.isVisible() and getattr(mirror, "_appbar_init_done", False):
+                    if self.settings.get("docked", True):
+                        QtCore.QTimer.singleShot(100, mirror.setup_appbar)
+                        QtCore.QTimer.singleShot(500, mirror._ensure_appbar_registered)
+        else:
+            self._appbar_init_done = False
+
+    def _repaint_mirrors(self, vsync=False):
+        for mirror in getattr(self, "_mirrors", []) or []:
+            if not mirror.isVisible():
+                continue
+            if vsync:
+                mirror.repaint()
+            else:
+                mirror.update()
+
+    def _show_mirrors(self):
+        for mirror in getattr(self, "_mirrors", []) or []:
+            if not mirror.isVisible():
+                mirror.show()
 
     def _init_fonts(self):
         scale = self.settings.get("font_scale_percent", 160) / 100.0
@@ -5335,21 +6322,19 @@ class NFLTicker(QtWidgets.QWidget):
                 x.lower()
                 for x in self.settings.get("fullscreen_override_exes", [])
             }
-            new_height = int(self.settings.get("ticker_height", 72))
-            self.ticker_height = new_height
-            geo = self._screen.geometry()
-            # Release the old strip first. Re-parking on that rect, or reading
-            # the work area it left behind, is what dropped the bar one slot
-            # lower on every Apply.
-            self.remove_appbar()
-            self.setGeometry(geo.x(), geo.y(), geo.width(), self.ticker_height)
-            if self.settings.get("docked", True):
-                self.setup_appbar()
+            # Rebuild primary + mirrors from the new display plan (also
+            # releases AppBars before re-parking so Apply cannot stack down).
+            self._apply_display_plan(show_mirrors=True)
             self._init_fonts()
             self.update_timer.setInterval(int(self.settings.get("update_interval", 15)) * 1000)
             self._update_scroll_speed()
             self.cached_background = None
             self._cached_bg_key = None
+            for mirror in self._mirrors:
+                mirror.settings = self.settings
+                mirror._fullscreen_override_exes = self._fullscreen_override_exes
+                mirror.cached_background = None
+                mirror._cached_bg_key = None
             self._slate_fp = None  # force strip rebuild after settings (colors/fonts/etc.)
             self.refresh_games()
 
@@ -5415,7 +6400,9 @@ class NFLTicker(QtWidgets.QWidget):
                 "games": None,
             }
             try:
-                payload["games"] = fetch_nfl_games(settings)
+                games, leaders = fetch_nfl_games(settings)
+                payload["games"] = games
+                payload["league_leaders"] = leaders
             except Exception as e:
                 payload["error"] = str(e)
             return payload
@@ -5443,6 +6430,7 @@ class NFLTicker(QtWidgets.QWidget):
             games = payload.get("games") or []
             self._detect_scoring_alerts(games)
             self.games = games
+            self._league_leaders = payload.get("league_leaders") or _empty_league_leaders()
             self._publish_strip()
             if payload.get("fetch"):
                 self._apply_poll_interval(games)
@@ -5466,6 +6454,7 @@ class NFLTicker(QtWidgets.QWidget):
         fp = _slate_fp(
             self.settings, self.games, self.qb_rotate_index,
             self.ticker_height, self.dpr,
+            league_leaders=getattr(self, "_league_leaders", None),
         )
         if fp == self._slate_fp and self._scroll_entries:
             return
@@ -5475,7 +6464,13 @@ class NFLTicker(QtWidgets.QWidget):
         gen = self._build_gen
         self._build_fp = fp
         games = list(self.games or [])
-        if not games:
+        jobs = _strip_card_jobs(
+            games,
+            self.qb_rotate_index,
+            self.settings,
+            league_leaders=getattr(self, "_league_leaders", None),
+        )
+        if not jobs:
             image, _period = _render_strip(self, [])
             cards = [image] if image is not None and not image.isNull() else []
             self._install_scroll_cards(cards, {}, fp, complete=True)
@@ -5483,9 +6478,7 @@ class NFLTicker(QtWidgets.QWidget):
         order = []
         misses = []
         cache = {}
-        for key, kind, game, side in _strip_card_jobs(
-            games, self.qb_rotate_index, self.settings
-        ):
+        for key, kind, game, side in jobs:
             order.append(key)
             img = self._card_cache.get(key)
             if img is None:
@@ -5524,6 +6517,8 @@ class NFLTicker(QtWidgets.QWidget):
         try:
             if kind == "post":
                 img = build_postgame_stats_card(host, game, side)
+            elif kind == "leaders":
+                img = build_league_leaders_card(host, game)
             elif (
                 game.get("state") in ("in", "post")
                 and not bool(self.settings.get("glow_all"))
@@ -5555,7 +6550,12 @@ class NFLTicker(QtWidgets.QWidget):
             if img is not None and not img.isNull():
                 self._build_cache[key] = img
         except Exception as e:
-            print(f"[CARD] {game.get('game_id')}: {e}")
+            label = (
+                game.get("title")
+                if kind == "leaders"
+                else game.get("game_id")
+            )
+            print(f"[CARD] {label}: {e}")
         self._build_i = i + 1
         done = self._build_i >= len(jobs)
         self._install_scroll_cards(
@@ -5673,6 +6673,8 @@ class NFLTicker(QtWidgets.QWidget):
         self.update()
 
     def _job_team_nicks(self, kind, game, side):
+        if kind == "leaders":
+            return ()
         if kind == "game":
             return (
                 get_team_nickname(game.get("away_name") or ""),
@@ -5688,7 +6690,12 @@ class NFLTicker(QtWidgets.QWidget):
         can center that game rather than a post-game stats line.
         """
         jobs = list(
-            _strip_card_jobs(self.games or [], self.qb_rotate_index, self.settings)
+            _strip_card_jobs(
+                self.games or [],
+                self.qb_rotate_index,
+                self.settings,
+                league_leaders=getattr(self, "_league_leaders", None),
+            )
         )
         tags = [()]
         card_n = max(0, len(self._scroll_entries) - 1)
@@ -5702,21 +6709,11 @@ class NFLTicker(QtWidgets.QWidget):
             tags.append(())
         self._scroll_entry_teams = tags[: len(self._scroll_entries)]
 
-    def _center_team_card(self, nick):
-        """Place the team's game card in the middle of the bar. True if found."""
-        want = (nick or "").strip().lower()
-        tags = getattr(self, "_scroll_entry_teams", None) or []
-        if not want or not self._scroll_entries or self._strip_w <= 0:
+    def _center_scroll_entry_at(self, idx):
+        """Place scroll entry idx in the middle of the bar. True if applied."""
+        if idx is None or not self._scroll_entries or self._strip_w <= 0:
             return False
-        idx = None
-        for i, team_nicks in enumerate(tags):
-            if not any(str(t).lower() == want for t in team_nicks):
-                continue
-            idx = i
-            if len(team_nicks) >= 2:
-                break
-        if idx is None:
-            print(f"[NFL-TCKR] Follow: {nick} is not on the ticker")
+        if idx < 0 or idx >= len(self._scroll_entries):
             return False
         start = 0.0
         gap = float(self._card_gap)
@@ -5735,9 +6732,46 @@ class NFLTicker(QtWidgets.QWidget):
                     if intro is not None and intro.isActive():
                         intro.stop()
                 self.update()
+                self._repaint_mirrors(vsync=False)
                 return True
             start += float(cw) + gap
         return False
+
+    def _center_team_card(self, nick):
+        """Place the team's game card in the middle of the bar. True if found."""
+        want = (nick or "").strip().lower()
+        tags = getattr(self, "_scroll_entry_teams", None) or []
+        if not want or not self._scroll_entries or self._strip_w <= 0:
+            return False
+        idx = None
+        for i, team_nicks in enumerate(tags):
+            if not any(str(t).lower() == want for t in team_nicks):
+                continue
+            idx = i
+            if len(team_nicks) >= 2:
+                break
+        if idx is None:
+            print(f"[NFL-TCKR] Follow: {nick} is not on the ticker")
+            return False
+        return self._center_scroll_entry_at(idx)
+
+    def _jump_to_leaders(self):
+        """Center the first Leaders card. No-op when Leaders are not on the strip."""
+        jobs = _strip_card_jobs(
+            self.games or [],
+            self.qb_rotate_index,
+            self.settings,
+            league_leaders=getattr(self, "_league_leaders", None),
+        )
+        job_idx = None
+        for i, (_key, kind, _card, _side) in enumerate(jobs):
+            if kind == "leaders":
+                job_idx = i
+                break
+        if job_idx is None:
+            return False
+        # Entry 0 is the loop marker; job i maps to scroll entry i + 1.
+        return self._center_scroll_entry_at(job_idx + 1)
 
     def _toggle_follow_team(self):
         """Center the Follow Team game and pause, or resume if already held."""
@@ -5766,6 +6800,7 @@ class NFLTicker(QtWidgets.QWidget):
         self._intro_hold = False
         self._prime_scroll_from_right()
         self.update()
+        self._repaint_mirrors(vsync=False)
 
     def _draw_intro_title(self, painter, w, h):
         text = "NFL-TCKR"
@@ -5879,21 +6914,26 @@ class NFLTicker(QtWidgets.QWidget):
             self._finish_alert()
             return
         self.update()
+        self._repaint_mirrors(vsync=False)
 
     def _finish_alert(self):
         self._alert_timer.stop()
         self._current_alert = None
         self._alert_phase = "idle"
         self.update()
+        self._repaint_mirrors(vsync=False)
         if self._alert_queue:
             QtCore.QTimer.singleShot(250, self._start_next_alert)
 
-    def _render_scoring_alert(self, painter, phase, phase_elapsed_ms):
+    def _render_scoring_alert(self, painter, phase, phase_elapsed_ms, w=None, h=None):
         """Full-bar team-color flash with sweep reveal (borrowed from MLB-TCKR)."""
         alert = self._current_alert
         if alert is None:
             return
-        w, h = self.width(), self.height()
+        if w is None:
+            w = self.width()
+        if h is None:
+            h = self.height()
         if phase == "in":
             bg_a = min(1.0, phase_elapsed_ms / 200.0)
         elif phase == "hold":
@@ -6050,6 +7090,7 @@ class NFLTicker(QtWidgets.QWidget):
         return _slate_fp(
             self.settings, self.games, self.qb_rotate_index,
             self.ticker_height, self.dpr,
+            league_leaders=getattr(self, "_league_leaders", None),
         )
 
     def _rebuild_cards(self):
@@ -6177,6 +7218,7 @@ class NFLTicker(QtWidgets.QWidget):
                 self.repaint()
             else:
                 self.update()
+            self._repaint_mirrors(vsync=_vsync)
             return
         if not self._scroll_primed:
             self._prime_scroll_from_right()
@@ -6184,11 +7226,13 @@ class NFLTicker(QtWidgets.QWidget):
             # Freeze scroll while scoring flash plays; don't accumulate catch-up
             self._last_frame_ms = now_ms
             self._scroll_dbg_note_tick(tick_dt, 0.0, paused=True, reason="alert")
+            self._repaint_mirrors(vsync=_vsync)
             return
         if self.paused or not self._scroll_entries or self._strip_w <= 0:
             self._last_frame_ms = now_ms
             reason = "hover/space" if self.paused else "no-strip"
             self._scroll_dbg_note_tick(tick_dt, 0.0, paused=True, reason=reason)
+            self._repaint_mirrors(vsync=_vsync)
             return
 
         if _vsync:
@@ -6213,6 +7257,7 @@ class NFLTicker(QtWidgets.QWidget):
             self.repaint()
         else:
             self.update()
+        self._repaint_mirrors(vsync=_vsync)
 
     def paintEvent(self, event):
         _paint_t0 = time.perf_counter() if _NFL_SCROLL_DEBUG else 0.0
@@ -6302,6 +7347,7 @@ class NFLTicker(QtWidgets.QWidget):
         self.scroll_offset = -float(max(1, self.width()))
         self._scroll_primed = bool(self._scroll_entries and self._strip_w > 0)
         self.update()
+        self._repaint_mirrors(vsync=False)
 
     def _replay_last_scoring_alert(self):
         """Play the most recent scoring banner again from the sweep-in."""
@@ -6314,6 +7360,7 @@ class NFLTicker(QtWidgets.QWidget):
         if not self._alert_timer.isActive():
             self._alert_timer.start(self._scroll_timer_interval_ms)
         self.update()
+        self._repaint_mirrors(vsync=False)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -6332,6 +7379,8 @@ class NFLTicker(QtWidgets.QWidget):
             self._replay_last_scoring_alert()
         elif key == QtCore.Qt.Key_F:
             self._toggle_follow_team()
+        elif key == QtCore.Qt.Key_L:
+            self._jump_to_leaders()
         elif key == QtCore.Qt.Key_Plus or (
             key == QtCore.Qt.Key_Equal
             and event.modifiers() & QtCore.Qt.ShiftModifier
@@ -6357,6 +7406,7 @@ class NFLTicker(QtWidgets.QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._show_mirrors()
         # AppBar needs a valid, visible HWND — defer until the window is realized.
         if not getattr(self, "_appbar_init_done", False):
             self._appbar_init_done = True
@@ -6395,6 +7445,7 @@ class NFLTicker(QtWidgets.QWidget):
             self.scroll_timer.stop()
         if hasattr(self, "_fullscreen_timer"):
             self._fullscreen_timer.stop()
+        self._destroy_mirrors()
         self.remove_appbar()
         event.accept()
 
@@ -7312,6 +8363,34 @@ class NFLTicker(QtWidgets.QWidget):
             print(f"[TICKER] _check_fullscreen error: {e}")
 
 
+# Borrow AppBar / fullscreen helpers onto TickerMirror (same HWND/monitor logic).
+for _appbar_name in (
+    "_ensure_appbar_registered",
+    "_is_primary_monitor_handle",
+    "_is_sister_ticker_hwnd",
+    "_other_sister_visible_on_monitor",
+    "_promote_passive_dock_to_appbar",
+    "_check_sister_appbar_layout",
+    "_window_occupies_top_inset",
+    "_bar_height_phys",
+    "_top_dock_inset_phys",
+    "_sync_appbar_below_top_docks",
+    "_park_window_at_reserved",
+    "_work_area_notify_allowed",
+    "_prepare_hwnd_for_appbar",
+    "_notify_same_monitor_work_area_change",
+    "_force_work_area_below_strip",
+    "_schedule_workarea_rebroadcasts",
+    "_window_bottom_phys",
+    "_refresh_appbar_geometry",
+    "_apply_passive_top_dock",
+    "setup_appbar",
+    "remove_appbar",
+    "_check_fullscreen",
+):
+    setattr(TickerMirror, _appbar_name, getattr(NFLTicker, _appbar_name))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -7360,6 +8439,7 @@ def main():
         flush=True,
     )
     ticker = NFLTicker()
+    app.aboutToQuit.connect(ticker._destroy_mirrors)
     app.aboutToQuit.connect(ticker.remove_appbar)
     app.aboutToQuit.connect(
         lambda: (

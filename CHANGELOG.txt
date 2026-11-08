@@ -1,6 +1,31 @@
 NFL-TCKR CHANGELOG
 ==================
 
+0.1.57 — 2026-11-08
+-------------------
+- Shortcut L jumps the scroll to the first Leaders card. Does nothing when
+  Leaders are not currently on the ticker.
+
+0.1.56 — 2026-11-08
+-------------------
+- Settings → Leaders tab: weekly and season PASSING / RUSHING / RECEIVING
+  leaders (top 1–5). Each scope can show during live games, when no live games
+  are running, or not at all. Weekly tops come from this week's in/post
+  scoreboard leaders; season tops from ESPN season leaders.
+
+0.1.55 — 2026-11-08
+-------------------
+- Fix crash when two or more displays are selected: mirror bars no longer borrow
+  NFLTicker.nativeEvent/moveEvent (super() failed on TickerMirror).
+
+0.1.54 — 2026-11-08
+-------------------
+- Settings → General: Display placement (Single / Clone / Continuous span) and
+  per-monitor checkboxes. Clone syncs the same scroll on each selected display;
+  span runs one continuous path left-to-right across them. Each bar docks and
+  hides for fullscreen on its own monitor. Applying settings re-reads the
+  display plan (monitor_index was previously ignored on Apply).
+
 0.1.52 — 2026-10-04
 -------------------
 - Settings → Shortcuts lists the ticker keys. + and − change scroll speed.

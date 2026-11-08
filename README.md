@@ -6,7 +6,7 @@ Displays a scrolling top-of-screen bar with team logos, colored names, scores,
 down & distance, last play, QB stats, ball-on field position, and a possession
 football icon.
 
-**Version:** 0.1.52  
+**Version:** 0.1.57  
 **Data:** ESPN public site API ([Public-ESPN-API](https://github.com/pseudo-r/Public-ESPN-API))
 
 ---
@@ -34,6 +34,19 @@ through the bottom of its own strip. Quitting or applying settings releases the
 strip. Fullscreen games/video hide the ticker (opacity); it returns when fullscreen
 ends. Uncheck Docked in Settings for a floating always-on-top bar with no reservation.
 
+### Multi-display
+
+In **Settings → General**, choose **Display placement** and tick which monitors to use:
+
+| Mode | Behavior |
+|------|----------|
+| **Single display** | One bar on the checked monitor (exactly one display) |
+| **Clone on each selected** | Identical bars on every checked monitor (synced scroll) |
+| **Continuous span across selected** | One left-to-right scroll path across the checked monitors |
+
+Each selected monitor gets its own top strip (with AppBar docking when Docked is on).
+Fullscreen hide is per monitor.
+
 ### Scroll smoothness debug
 
 Scroll judder profiling is **OFF by default**. Enable with `--debug`:
@@ -59,14 +72,19 @@ Console lines tagged `[SCROLL]`:
 | Start scroll over | **T** |
 | Replay last scoring banner | **R** |
 | Center Follow Team | **F** (pauses; **F** or **P** resumes) |
+| Jump to Leaders | **L** (no-op if Leaders are not showing) |
 | Scroll speed | **+** faster, **−** slower |
 | Quit | Tray → Quit, or press **Q** |
 
 Settings are stored in `%APPDATA%\NFL-TCKR\NFL-TCKR.Settings.json`.
 
-- **General:** speed, refresh, height, docked AppBar, Follow Team, background/content
-  transparency, glow options, name display, filters, optional post-game
-  PASS/RUSH/REC/SACKS/TACKLE leaders after each final (with a chosen post-game stats font)
+- **General:** speed, refresh, height, docked AppBar, display placement + monitor
+  checkboxes, Follow Team, background/content transparency, glow options, name
+  display, filters, optional post-game PASS/RUSH/REC/SACKS/TACKLE leaders after
+  each final (with a chosen post-game stats font)
+- **Leaders:** weekly and season PASSING / RUSHING / RECEIVING league leaders
+  (top 1–5 each). Show during live games, when no live games are running, or
+  do not show — weekly and season are configured separately
 - **Shortcuts:** keys that work while the ticker is focused
 - **Team Colors:** per-team Primary / Secondary / Tertiary / Custom (names + scoring flash)
 

@@ -39,3 +39,9 @@ Desktop.ini
 *.tmp
 *.bak
 *.orig
+
+# Oversized demo masters (use *_compressed*.mp4 in docs instead)
+docs/**/NFLTCKR-scroll-180s.mp4
+docs/**/nfl-tckr-demo-1.mp4
+docs/NFLTCKR-scroll-180s.mp4
+docs/nfl-tckr-demo-1.mp4

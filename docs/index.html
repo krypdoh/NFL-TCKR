@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NFL-TCKR — Live NFL Score Ticker for Windows</title>
+  <meta name="description" content="NFL-TCKR is a docked desktop ticker that scrolls live NFL scores, drives, QB lines, and leaders across your monitors." />
+  <link rel="icon" href="media/nfl-com-logo.png" type="image/png" />
+  <style>
+    @font-face {
+      font-family: "Ozone";
+      src: url("media/Ozone-xRRO.ttf") format("truetype");
+      font-weight: 400 900;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "Gotham Ultra";
+      src: url("media/Gotham-Ultra.otf") format("opentype");
+      font-weight: 900;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "Gotham Black";
+      src: url("media/Gotham-Black.otf") format("opentype");
+      font-weight: 900;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: "Subway Ticker";
+      src: url("media/SubwayTicker.ttf") format("truetype");
+      font-weight: 400;
+      font-display: swap;
+    }
+
+    :root {
+      --ink: #070b08;
+      --turf: #0c1f14;
+      --turf-mid: #143525;
+      --led: #1a4d2e;
+      --gold: #ffd700;
+      --gold-dim: #c4a000;
+      --bone: #f2f0e6;
+      --mist: #a8b5a4;
+      --line: rgba(255, 215, 0, 0.18);
+      --glass: rgba(7, 11, 8, 0.72);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--bone);
+      background: var(--ink);
+      font-family: "Gotham Black", "Arial Black", Impact, sans-serif;
+      line-height: 1.35;
+      overflow-x: hidden;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    img, video { display: block; max-width: 100%; }
+
+    /* Atmospheric turf + LED scanlines behind everything */
+    .atmosphere {
+      position: fixed;
+      inset: 0;
+      z-index: -2;
+      background:
+        radial-gradient(ellipse 90% 55% at 50% -10%, rgba(26, 77, 46, 0.55), transparent 60%),
+        radial-gradient(ellipse 70% 40% at 80% 80%, rgba(196, 160, 0, 0.12), transparent 55%),
+        linear-gradient(180deg, #050805 0%, var(--turf) 45%, #050805 100%);
+    }
+    .atmosphere::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.22) 0 2px,
+        transparent 2px 4px
+      );
+      animation: scan 8s linear infinite;
+      pointer-events: none;
+      opacity: 0.55;
+    }
+    @keyframes scan {
+      from { background-position: 0 0; }
+      to { background-position: 0 80px; }
+    }
+
+    .wrap {
+      width: min(1120px, calc(100% - 2.5rem));
+      margin-inline: auto;
+    }
+
+    /* -------- HERO: ticker strip + copy stacked (no empty 100vh gap) -------- */
+    .hero {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      isolation: isolate;
+      overflow: hidden;
+    }
+    .hero-video {
+      position: relative;
+      width: 100%;
+      height: clamp(120px, 22vw, 220px);
+      flex-shrink: 0;
+      background: #000;
+    }
+    .hero-video video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center top;
+      filter: saturate(1.05) contrast(1.05);
+    }
+    .hero-video::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(180deg, transparent 55%, rgba(5, 8, 5, 0.85) 100%),
+        linear-gradient(90deg, rgba(5, 8, 5, 0.35) 0%, transparent 28%, transparent 72%, rgba(5, 8, 5, 0.3) 100%);
+    }
+
+    .hero-copy {
+      position: relative;
+      padding: clamp(1.25rem, 3vh, 2rem) 0 clamp(2rem, 5vh, 3rem);
+      animation: rise 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(28px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      margin: 0 0 1rem;
+    }
+    .brand img {
+      width: clamp(42px, 6vw, 64px);
+      height: auto;
+      filter: drop-shadow(0 0 12px rgba(255, 215, 0, 0.35));
+    }
+    .brand-name {
+      font-family: "Ozone", Impact, sans-serif;
+      font-size: clamp(3.4rem, 11vw, 7.5rem);
+      line-height: 0.85;
+      letter-spacing: 0.02em;
+      color: var(--gold);
+      text-transform: uppercase;
+      text-shadow:
+        0 0 24px rgba(255, 215, 0, 0.35),
+        0 4px 0 rgba(0, 0, 0, 0.65);
+      margin: 0;
+    }
+
+    .hero-line {
+      font-family: "Gotham Ultra", "Gotham Black", Impact, sans-serif;
+      font-size: clamp(1.55rem, 4.2vw, 3rem);
+      line-height: 1.05;
+      letter-spacing: 0.01em;
+      text-transform: uppercase;
+      max-width: 16ch;
+      margin: 0 0 0.85rem;
+      color: var(--bone);
+    }
+
+    .hero-sub {
+      font-family: "Subway Ticker", "Ozone", monospace;
+      font-size: clamp(0.95rem, 2vw, 1.25rem);
+      letter-spacing: 0.06em;
+      color: var(--mist);
+      max-width: 38ch;
+      margin: 0 0 1.75rem;
+    }
+
+    .cta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.55rem;
+      min-height: 3.1rem;
+      padding: 0.75rem 1.35rem;
+      font-family: "Gotham Black", Impact, sans-serif;
+      font-size: clamp(0.95rem, 1.6vw, 1.1rem);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 2px solid var(--gold);
+      transition: transform 0.2s ease, background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .btn-primary {
+      background: var(--gold);
+      color: #111;
+      box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.35);
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 0 28px rgba(255, 215, 0, 0.35);
+    }
+    .btn-ghost {
+      background: transparent;
+      color: var(--gold);
+    }
+    .btn-ghost:hover {
+      background: rgba(255, 215, 0, 0.1);
+      transform: translateY(-2px);
+    }
+
+    /* -------- SECTIONS -------- */
+    section {
+      padding: clamp(3.5rem, 8vh, 6rem) 0;
+    }
+    .section-kicker {
+      font-family: "Subway Ticker", monospace;
+      font-size: 0.95rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--gold-dim);
+      margin: 0 0 0.65rem;
+    }
+    .section-title {
+      font-family: "Gotham Ultra", Impact, sans-serif;
+      font-size: clamp(2rem, 5.5vw, 3.6rem);
+      line-height: 0.95;
+      text-transform: uppercase;
+      letter-spacing: 0.01em;
+      margin: 0 0 0.75rem;
+      max-width: 14ch;
+    }
+    .section-lead {
+      font-family: "Gotham Black", Impact, sans-serif;
+      font-size: clamp(1.05rem, 2vw, 1.25rem);
+      color: var(--mist);
+      max-width: 42ch;
+      margin: 0 0 2rem;
+      font-weight: 900;
+    }
+
+    .logo-marquee {
+      border-block: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+      padding: 1.1rem 0;
+    }
+    .logo-marquee.logo-marquee-lower {
+      margin-top: 0;
+      border-top: none;
+    }
+    .logo-track {
+      display: flex;
+      width: max-content;
+      gap: 2.5rem;
+      animation: marquee 48s linear infinite;
+      align-items: center;
+      padding-inline: 1rem;
+    }
+    .logo-track-reverse {
+      animation-name: marquee-reverse;
+      animation-duration: 52s;
+    }
+    .logo-track img {
+      height: 48px;
+      width: auto;
+      opacity: 0.88;
+      filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.5));
+    }
+    @keyframes marquee {
+      from { transform: translateX(0); }
+      to { transform: translateX(-50%); }
+    }
+    @keyframes marquee-reverse {
+      from { transform: translateX(-50%); }
+      to { transform: translateX(0); }
+    }
+
+    .feature-list {
+      display: grid;
+      gap: 1.75rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    @media (min-width: 760px) {
+      .feature-list {
+        grid-template-columns: 1fr 1fr;
+        gap: 2rem 2.5rem;
+      }
+    }
+    .feature-list li {
+      border-top: 2px solid var(--line);
+      padding-top: 1rem;
+    }
+    .feature-list h3 {
+      font-family: "Ozone", Impact, sans-serif;
+      font-size: clamp(1.5rem, 3vw, 2rem);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--gold);
+      margin: 0 0 0.45rem;
+    }
+    .feature-list p {
+      margin: 0;
+      color: var(--mist);
+      font-size: 1.05rem;
+      max-width: 36ch;
+    }
+
+    .demo-block {
+      position: relative;
+    }
+    .demo-frame {
+      position: relative;
+      border: 2px solid var(--line);
+      background: #000;
+      overflow: hidden;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    }
+    .demo-frame video {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      background: #000;
+    }
+    .demo-caption {
+      margin-top: 0.85rem;
+      font-family: "Subway Ticker", monospace;
+      letter-spacing: 0.08em;
+      color: var(--mist);
+      font-size: 0.95rem;
+    }
+
+    .get-it {
+      border-top: 1px solid var(--line);
+      background:
+        linear-gradient(180deg, rgba(20, 53, 37, 0.45), transparent 70%);
+    }
+    .get-it .section-title { max-width: 18ch; }
+    .get-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      margin-top: 0.5rem;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      padding: 2.5rem 0 3.5rem;
+    }
+    .disclaimer {
+      font-family: "Gotham Black", Impact, sans-serif;
+      font-size: 0.85rem;
+      line-height: 1.55;
+      color: #7e8a7a;
+      max-width: 70ch;
+      margin: 0 0 1.25rem;
+    }
+    .footer-meta {
+      font-family: "Subway Ticker", monospace;
+      letter-spacing: 0.1em;
+      font-size: 0.85rem;
+      color: var(--gold-dim);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.5rem;
+      align-items: center;
+    }
+    .footer-meta a:hover { color: var(--gold); }
+
+    @media (prefers-reduced-motion: reduce) {
+      .atmosphere::after,
+      .logo-track,
+      .logo-track-reverse,
+      .hero-copy { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <header class="hero">
+    <div class="hero-video" aria-hidden="true">
+      <video autoplay muted loop playsinline poster="media/nfl-com-logo.png">
+        <source src="media/NFLTCKR-scroll-180s_compressed.mp4" type="video/mp4" />
+      </video>
+    </div>
+    <div class="wrap hero-copy">
+      <div class="brand">
+        <img src="media/nfl-com-logo.png" width="64" height="64" alt="" />
+        <h1 class="brand-name">NFL-TCKR</h1>
+      </div>
+      <p class="hero-line">Live scores. Docked. Scrolling.</p>
+      <p class="hero-sub">A Windows desktop ticker for the NFL slate — logos, drives, QB lines, leaders.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/krypdoh/NFL-TCKR/releases">Download Releases</a>
+        <a class="btn btn-ghost" href="https://github.com/krypdoh/NFL-TCKR">View on GitHub</a>
+      </div>
+    </div>
+  </header>
+
+  <!-- AFC logos (16) — duplicated for seamless loop -->
+  <div class="logo-marquee" aria-hidden="true">
+    <div class="logo-track">
+      <img src="media/buffalo-bills-logo.png" alt="" />
+      <img src="media/miami-dolphins-logo.png" alt="" />
+      <img src="media/new-england-patriots-logo.png" alt="" />
+      <img src="media/new-york-jets-logo-2024.png" alt="" />
+      <img src="media/baltimore-ravens-logo.png" alt="" />
+      <img src="media/cincinnati-bengals-logo.png" alt="" />
+      <img src="media/cleveland-browns-logo.png" alt="" />
+      <img src="media/pittsburgh-steelers-logo.png" alt="" />
+      <img src="media/houston-texans-logo.png" alt="" />
+      <img src="media/indianapolis-colts-logo.png" alt="" />
+      <img src="media/jacksonville-jaguars-logo.png" alt="" />
+      <img src="media/tennessee-titans-logo.png" alt="" />
+      <img src="media/denver-broncos-logo.png" alt="" />
+      <img src="media/kansas-city-chiefs-logo.png" alt="" />
+      <img src="media/oakland-raiders-logo.png" alt="" />
+      <img src="media/los-angeles-chargers-logo.png" alt="" />
+      <img src="media/buffalo-bills-logo.png" alt="" />
+      <img src="media/miami-dolphins-logo.png" alt="" />
+      <img src="media/new-england-patriots-logo.png" alt="" />
+      <img src="media/new-york-jets-logo-2024.png" alt="" />
+      <img src="media/baltimore-ravens-logo.png" alt="" />
+      <img src="media/cincinnati-bengals-logo.png" alt="" />
+      <img src="media/cleveland-browns-logo.png" alt="" />
+      <img src="media/pittsburgh-steelers-logo.png" alt="" />
+      <img src="media/houston-texans-logo.png" alt="" />
+      <img src="media/indianapolis-colts-logo.png" alt="" />
+      <img src="media/jacksonville-jaguars-logo.png" alt="" />
+      <img src="media/tennessee-titans-logo.png" alt="" />
+      <img src="media/denver-broncos-logo.png" alt="" />
+      <img src="media/kansas-city-chiefs-logo.png" alt="" />
+      <img src="media/oakland-raiders-logo.png" alt="" />
+      <img src="media/los-angeles-chargers-logo.png" alt="" />
+    </div>
+  </div>
+
+  <section id="features">
+    <div class="wrap">
+      <p class="section-kicker">What it does</p>
+      <h2 class="section-title">Built for game day desktops</h2>
+      <p class="section-lead">Keep the slate in the corner of your eye while you work, stream, or watch.</p>
+      <ul class="feature-list">
+        <li>
+          <h3>Docked AppBar</h3>
+          <p>Reserves the top of the screen so windows don’t hide under the strip. Float it if you prefer.</p>
+        </li>
+        <li>
+          <h3>Multi-display</h3>
+          <p>Single, clone, or continuous span across the monitors you pick.</p>
+        </li>
+        <li>
+          <h3>Live detail</h3>
+          <p>Scores, down &amp; distance, last play, QB stats, ball-on, possession, and scoring flash.</p>
+        </li>
+        <li>
+          <h3>Leaders</h3>
+          <p>Weekly and season PASS / RUSH / REC leaders — jump to them with L when they’re on the ticker.</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- NFC logos (16) — opposite scroll direction -->
+  <div class="logo-marquee logo-marquee-lower" aria-hidden="true">
+    <div class="logo-track logo-track-reverse">
+      <img src="media/dallas-cowboys-logo.png" alt="" />
+      <img src="media/new-york-giants-logo.png" alt="" />
+      <img src="media/philadelphia-eagles-logo.png" alt="" />
+      <img src="media/washington-commanders-logo.png" alt="" />
+      <img src="media/chicago-bears-logo.png" alt="" />
+      <img src="media/detroit-lions-logo.png" alt="" />
+      <img src="media/green-bay-packers-logo.png" alt="" />
+      <img src="media/minnesota-vikings-logo.png" alt="" />
+      <img src="media/atlanta-falcons-logo.png" alt="" />
+      <img src="media/carolina-panthers-logo.png" alt="" />
+      <img src="media/new-orleans-saints-logo.png" alt="" />
+      <img src="media/tampa-bay-buccaneers-logo.png" alt="" />
+      <img src="media/arizona-cardinals-logo.png" alt="" />
+      <img src="media/los-angeles-rams-logo.png" alt="" />
+      <img src="media/san-francisco-49ers-logo.png" alt="" />
+      <img src="media/seattle-seahawks-logo.png" alt="" />
+      <img src="media/dallas-cowboys-logo.png" alt="" />
+      <img src="media/new-york-giants-logo.png" alt="" />
+      <img src="media/philadelphia-eagles-logo.png" alt="" />
+      <img src="media/washington-commanders-logo.png" alt="" />
+      <img src="media/chicago-bears-logo.png" alt="" />
+      <img src="media/detroit-lions-logo.png" alt="" />
+      <img src="media/green-bay-packers-logo.png" alt="" />
+      <img src="media/minnesota-vikings-logo.png" alt="" />
+      <img src="media/atlanta-falcons-logo.png" alt="" />
+      <img src="media/carolina-panthers-logo.png" alt="" />
+      <img src="media/new-orleans-saints-logo.png" alt="" />
+      <img src="media/tampa-bay-buccaneers-logo.png" alt="" />
+      <img src="media/arizona-cardinals-logo.png" alt="" />
+      <img src="media/los-angeles-rams-logo.png" alt="" />
+      <img src="media/san-francisco-49ers-logo.png" alt="" />
+      <img src="media/seattle-seahawks-logo.png" alt="" />
+    </div>
+  </div>
+
+  <section id="demo" class="demo-block">
+    <div class="wrap">
+      <p class="section-kicker">See it scroll</p>
+      <h2 class="section-title">Demo reel</h2>
+      <p class="section-lead">The same LED strip vibe as the desktop bar — full width, always moving.</p>
+      <div class="demo-frame">
+        <video controls playsinline preload="metadata" poster="media/nfl-com-logo.png">
+          <source src="media/NFLTCKR-scroll-180s_compressed.mp4" type="video/mp4" />
+          Your browser does not support the video tag.
+        </video>
+      </div>
+      <p class="demo-caption">Demo — NFL-TCKR on Windows</p>
+    </div>
+  </section>
+
+  <section id="download" class="get-it">
+    <div class="wrap">
+      <p class="section-kicker">Get the app</p>
+      <h2 class="section-title">Grab a build. Star the repo.</h2>
+      <p class="section-lead">Windows releases ship from GitHub. Source and issues live there too.</p>
+      <div class="get-links">
+        <a class="btn btn-primary" href="https://github.com/krypdoh/NFL-TCKR/releases">Download Releases</a>
+        <a class="btn btn-ghost" href="https://github.com/krypdoh/NFL-TCKR">github.com/krypdoh/NFL-TCKR</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <p class="disclaimer">
+        <strong>Disclaimer:</strong> NFL-TCKR is an unofficial, fan-made application for entertainment
+        purposes only. It is not affiliated with, endorsed by, or sponsored by the National Football
+        League (NFL), NFL Properties, any NFL team, club, player, or related entity. All team names,
+        logos, marks, uniforms, statistics, and other trademarks or copyrighted materials remain the
+        property of their respective owners. Game data is sourced from publicly available third-party
+        feeds and may be incomplete or delayed. Use at your own risk.
+      </p>
+      <div class="footer-meta">
+        <span>NFL-TCKR</span>
+        <a href="https://github.com/krypdoh/NFL-TCKR">GitHub</a>
+        <a href="https://github.com/krypdoh/NFL-TCKR/releases">Releases</a>
+        <a href="#demo">Demo</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
